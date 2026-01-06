@@ -1,3 +1,4 @@
+import logging
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 from langgraph.graph import StateGraph, START, END
@@ -6,6 +7,9 @@ from langgraph.types import RetryPolicy
 from pydantic import SecretStr
 from data.State import State
 from tool.screen_content import *
+
+# Setup logging
+logger = logging.getLogger(__name__)
 
 os.environ["LANGCHAIN_TRACING_V2"] = config.LANGCHAIN_TRACING_V2
 os.environ["LANGCHAIN_ENDPOINT"] = config.LANGCHAIN_ENDPOINT
@@ -39,7 +43,10 @@ def tsk_setting(state: State):
         )
     ]
 
-    state["device_info"] = get_device_size.invoke(state["device"])
+    # Use device_info from state if already set (e.g., from controller initialization)
+    # Otherwise fetch it using the tool
+    if not state.get("device_info"):
+        state["device_info"] = get_device_size.invoke({"device": state["device"]})
 
     # Prepare additional information to pass to the callback function
     callback_info = {
@@ -218,8 +225,8 @@ def tsk_completed(state: State):
     2. Use the three screenshots and the completion criteria generated in the first step to ask LLM to judge whether the task is completed.
     """
 
-    # If step is less than 3, no judgment is made, directly return current completion status
-    if state["step"] < 2:
+    # If step is less than 4, no judgment is made - allow more steps before checking completion
+    if state["step"] < 4:
         return state["completed"]
 
     # Get user task description
@@ -286,11 +293,15 @@ def tsk_completed(state: State):
     # Build final judgment dialog information
     judgement_messages = [
         SystemMessage(
-            content="You are a page judgment assistant, you will judge whether the task is completed based on the given completion criteria and current page screenshot."
+            content="You are a strict task completion judge. You must verify that ALL parts of the user's task have been completed, not just partial completion. Only answer 'yes' or 'complete' if the ENTIRE task is done."
         ),
         HumanMessage(
-            content=f"Completion criteria: {completion_criteria}\n"
-            f"Please judge whether the task is completed based on the following three page screenshots. Please note that if all three screenshots are complete, it indicates task failure, please directly reply yes or complete to end the program."
+            content=f"Original task: {user_task}\n\n"
+            f"Completion criteria: {completion_criteria}\n\n"
+            f"Based on the following screenshots, determine if the ENTIRE task is complete. "
+            f"If the task has multiple parts (e.g., 'open app AND do something'), ALL parts must be done. "
+            f"If you see a dialog, popup, or intermediate screen that requires user action before the task can continue, answer 'no'. "
+            f"Only answer 'yes' or 'complete' if you can clearly see the final expected result of the task."
         ),
     ] + image_messages
 
@@ -330,7 +341,7 @@ def tsk_completed(state: State):
         SystemMessage(content=f"Final task completion status: {state['completed']}")
     )
 
-    if state["step"] > 5:  # Debug use
+    if state["step"] > 20:  # Safety limit to prevent infinite loops
         screen_img = take_screenshot.invoke(
             {
                 "device": state["device"],
@@ -351,7 +362,17 @@ def tsk_completed(state: State):
 
 # User interaction interface
 def run_task(initial_state: State, progress_callback=None):
+    logger.info("="*60)
+    logger.info("EXPLOR_AUTO.RUN_TASK called")
+    logger.info("="*60)
+    logger.info(f"initial_state type: {type(initial_state)}")
+    logger.info(f"initial_state.tsk: '{initial_state.get('tsk', 'NOT SET')}'")
+    logger.info(f"initial_state.device: '{initial_state.get('device', 'NOT SET')}'")
+    logger.info(f"initial_state.controller: {initial_state.get('controller', 'NOT SET')}")
+    logger.info(f"progress_callback: {progress_callback}")
+
     # Build StateGraph
+    logger.info("Building StateGraph...")
     graph_builder = StateGraph(State)
     # Define nodes in the graph
     graph_builder.add_node(
@@ -371,7 +392,9 @@ def run_task(initial_state: State, progress_callback=None):
     graph_builder.add_edge("perform_action", "page_understand")
 
     # Compile graph
+    logger.info("Compiling graph...")
     graph = graph_builder.compile()
+    logger.info("Graph compiled successfully")
 
     # Visualize graph
     # graph.get_graph().draw_mermaid_png(output_file_path="graph_vis.png")
@@ -379,6 +402,21 @@ def run_task(initial_state: State, progress_callback=None):
     # Put callback into state
     if progress_callback is not None:
         initial_state["callback"] = progress_callback
+        logger.info("Callback attached to state")
 
-    result = graph.invoke(initial_state)
-    return result
+    logger.info("Invoking graph.invoke(initial_state)...")
+    try:
+        result = graph.invoke(initial_state)
+        logger.info("graph.invoke completed!")
+        logger.info(f"result type: {type(result)}")
+        if result:
+            logger.info(f"result.tsk: '{result.get('tsk', 'NOT SET')}'")
+            logger.info(f"result.step: {result.get('step', 'NOT SET')}")
+            logger.info(f"result.app_name: '{result.get('app_name', 'NOT SET')}'")
+            logger.info(f"result.history_steps count: {len(result.get('history_steps', []))}")
+        else:
+            logger.error("result is None!")
+        return result
+    except Exception as e:
+        logger.exception(f"graph.invoke EXCEPTION: {e}")
+        raise

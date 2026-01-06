@@ -11,14 +11,15 @@ import torch
 import pandas as pd
 import uvicorn
 
-# 初始化 FastAPI
+# Initialize FastAPI
 app = FastAPI()
 
-# 默认设备
-device = 'cuda:0'
+# Auto-detect device (GPU if available, otherwise CPU)
+device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
+print(f"Using device: {device}")
 
-# 初始化模型，只加载一次
-yolo_model_path = 'weights/icon_detect_v1_5/best.pt'
+# Initialize models (only loaded once at startup)
+yolo_model_path = 'weights/icon_detect_v1_5/model_v1_5.pt'
 caption_model_name = 'florence2'
 caption_model_path = 'weights/icon_caption_florence'
 
@@ -40,7 +41,7 @@ async def process_image(
 ):
     try:
         
-        # 保存上传文件到临时路径
+        # Save uploaded file to temporary path
         contents = await file.read()
         temp_dir = tempfile.mkdtemp()
         temp_image_path = os.path.join(temp_dir, file.filename)
@@ -51,7 +52,7 @@ async def process_image(
         
         image = Image.open(temp_image_path).convert('RGB')
         start_time = time.time()
-        # OCR 检测
+        # OCR detection
         ocr_bbox_rslt, _ = check_ocr_box(
             temp_image_path,
             display_img=False,
@@ -62,7 +63,7 @@ async def process_image(
         )
         text, ocr_bbox = ocr_bbox_rslt
         
-        # 生成标注图像和解析内容
+        # Generate labeled image and parsed content
         draw_bbox_config = {
             'text_scale': 0.8 * (max(image.size) / 3200),
             'text_thickness': max(int(2 * (max(image.size) / 3200)), 1),
@@ -86,21 +87,21 @@ async def process_image(
             imgsz=imgsz_component
         )
         elapsed_time = time.time() - start_time
-        # 删除临时文件
+        # Delete temporary files
         os.remove(temp_image_path)
         os.rmdir(temp_dir)
         
 
-        # 返回标注图片和解析内容
+        # Return labeled image and parsed content
         image_bytes = base64.b64decode(dino_labeled_img)
         labeled_image = io.BytesIO(image_bytes)
 
-        # 解析内容转 DataFrame -> JSON
+        # Convert parsed content to DataFrame -> JSON
         df = pd.DataFrame(parsed_content_list)
         df['ID'] = range(len(df))
         parsed_content_json = df.to_dict(orient="records")
 
-        # base64 编码
+        # Base64 encode the image
         encoded_image = base64.b64encode(labeled_image.getvalue())
         
 
@@ -108,10 +109,12 @@ async def process_image(
             "status": "success",
             "parsed_content": parsed_content_json,
             "labeled_image": encoded_image,
-            "e_time": elapsed_time  # 返回耗时
+            "e_time": elapsed_time  # Return elapsed time
         }
 
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         return JSONResponse(status_code=500, content={"error": str(e)})
 
 # nohup fastapi run omni.py --port 8000 > ../logfile_omni.log 2>&1

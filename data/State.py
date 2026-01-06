@@ -3,6 +3,10 @@ from langgraph.graph import add_messages
 from pydantic import BaseModel, Field
 from typing_extensions import TypedDict
 
+# Import at runtime (not just TYPE_CHECKING) because LangGraph's StateGraph
+# uses get_type_hints() which needs to resolve the forward reference
+from device.controller import DeviceController
+
 
 class State(TypedDict):
     """
@@ -38,8 +42,9 @@ class State(TypedDict):
     ]  # Results of tool calls (e.g., returns from OCR, API calls, etc.)
 
     # Device related
-    device: str  # Device name or ID
+    device: str  # Device name or ID (kept for backwards compatibility)
     device_info: Dict  # Detailed device information (resolution, etc.)
+    controller: Optional[DeviceController]  # The device controller instance
 
     # Context related
     context: Annotated[
@@ -69,7 +74,8 @@ class DeploymentState(TypedDict):
     max_retries: int  # Maximum retry count
 
     # Device related
-    device: str  # Device ID
+    device: str  # Device ID (kept for backwards compatibility)
+    controller: Optional[DeviceController]  # The device controller instance
 
     # Page information
     current_page: (
@@ -100,6 +106,7 @@ def create_deployment_state(
     device: str,
     max_retries: int = 3,
     callback: Optional[Callable[[TypedDict], None]] = None,
+    controller: Optional[DeviceController] = None,
 ) -> DeploymentState:
     """
     Create and initialize DeploymentState object
@@ -109,6 +116,7 @@ def create_deployment_state(
         device: Device ID
         max_retries: Maximum retry count, default is 3
         callback: Callback function (optional)
+        controller: DeviceController instance (optional)
 
     Returns:
         Initialized DeploymentState object
@@ -128,6 +136,7 @@ def create_deployment_state(
 
     # Device related
     state["device"] = device
+    state["controller"] = controller
 
     # Page information
     state["current_page"] = {

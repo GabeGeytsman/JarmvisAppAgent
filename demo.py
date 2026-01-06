@@ -2,6 +2,7 @@ import datetime
 import json
 import os
 import threading
+import logging
 from queue import Queue
 import gradio as gr
 import config
@@ -11,7 +12,24 @@ from chain_understand import process_and_update_chain, Neo4jDatabase
 from data.State import State
 from data.data_storage import state2json, json2db
 from explor_human import single_human_explor, capture_and_parse_page
-from tool.screen_content import list_all_devices, get_device_size
+from tool.screen_content import list_all_devices, get_device_size, set_controller
+from device import ADBController
+
+# =============================================================================
+# DEBUG LOGGING SETUP
+# =============================================================================
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    handlers=[
+        logging.FileHandler('/tmp/demo_debug.log'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+logger.info("="*60)
+logger.info("DEMO.PY STARTED - Debug logging enabled")
+logger.info("="*60)
 
 auto_log_storage = []  # Global log storage for automatic exploration
 auto_page_storage = []  # Global page history storage for automatic exploration
@@ -54,11 +72,29 @@ def get_adb_devices():
 
 def initialize_device(device, task_info):
     global temp_state
+    logger.info("="*40)
+    logger.info("INITIALIZE_DEVICE called")
+    logger.info(f"  device param: '{device}'")
+    logger.info(f"  task_info param: '{task_info}'")
+    logger.info("="*40)
+
     if not task_info:
+        logger.error("INIT FAILED: task_info is empty")
         return "Error: Task Information cannot be empty."
     if not device or device == "No devices found":
+        logger.error("INIT FAILED: no valid device")
         return "Error: Please select a valid ADB device."
-    device_size = get_device_size.invoke({"device": device})
+
+    # Create and set the device controller
+    logger.info(f"Creating ADBController for device: {device}")
+    controller = ADBController(device_id=device)
+    set_controller(controller)
+
+    # Get device size from the controller
+    width, height = controller.screen_size
+    device_size = {"width": width, "height": height}
+    logger.info(f"Device size: {device_size}")
+
     temp_state = State(
         tsk=task_info,
         app_name="",
@@ -73,26 +109,51 @@ def initialize_device(device, task_info):
         tool_results=[],
         device=device,
         device_info=device_size,
+        controller=controller,
         context=[],
         errors=[],
         current_page_json=None,
         callback=None,
     )
+
+    logger.info("temp_state created successfully:")
+    logger.info(f"  tsk: '{temp_state.get('tsk', 'NOT SET')}'")
+    logger.info(f"  device: '{temp_state.get('device', 'NOT SET')}'")
+    logger.info(f"  controller: {temp_state.get('controller', 'NOT SET')}")
+    logger.info(f"  step: {temp_state.get('step', 'NOT SET')}")
+
     return f"Device: {device}, Task Info: {task_info} initialized."
 
 
 def auto_exploration():
     global auto_log_storage, auto_page_storage, temp_state
 
+    logger.info("="*60)
+    logger.info("AUTO_EXPLORATION called")
+    logger.info("="*60)
+
     if not temp_state:
+        logger.error("AUTO_EXPLORATION: temp_state is None!")
+        logger.error("User did not initialize device/task first")
         auto_log_storage.append("Error: Please initialize device and task info first.")
         yield "\n".join(auto_log_storage), auto_page_storage
         return
+
+    # Log the temp_state before exploration
+    logger.info("temp_state BEFORE exploration:")
+    logger.info(f"  tsk: '{temp_state.get('tsk', 'NOT SET')}'")
+    logger.info(f"  app_name: '{temp_state.get('app_name', 'NOT SET')}'")
+    logger.info(f"  device: '{temp_state.get('device', 'NOT SET')}'")
+    logger.info(f"  controller: {temp_state.get('controller', 'NOT SET')}")
+    logger.info(f"  step: {temp_state.get('step', 'NOT SET')}")
+    logger.info(f"  completed: {temp_state.get('completed', 'NOT SET')}")
+    logger.info(f"  history_steps count: {len(temp_state.get('history_steps', []))}")
 
     q = Queue()
     final_state_queue = Queue()
 
     def callback(state, node_name=None, info=None):
+        logger.info(f"CALLBACK: node={node_name}, step={state.get('step')}")
         auto_log_storage.append("--" * 10)
         auto_log_storage.append(
             f"Current execution step: {state['step']}, Completed node: {node_name}"
@@ -101,6 +162,7 @@ def auto_exploration():
             auto_log_storage.append("Additional information:")
             for k, v in info.items():
                 auto_log_storage.append(f"   {k}: {v}")
+                logger.info(f"  CALLBACK info: {k}={v}")
 
         if state.get("tool_results"):
             for tool_result in state["tool_results"]:
@@ -110,18 +172,36 @@ def auto_exploration():
                         labeled_image = result.get("labeled_image_path")
                         if labeled_image and labeled_image not in auto_page_storage:
                             auto_page_storage.append(labeled_image)
+                            logger.info(f"  CALLBACK: Added image {labeled_image}")
 
         q.put(("\n".join(auto_log_storage), auto_page_storage))
 
     def run_exploration():
-        final_state = run_task(temp_state, callback)
-        final_state_queue.put(final_state)
+        logger.info("run_exploration THREAD started")
+        try:
+            logger.info("Calling run_task(temp_state, callback)...")
+            final_state = run_task(temp_state, callback)
+            logger.info("run_task returned!")
+            logger.info(f"  final_state type: {type(final_state)}")
+            if final_state:
+                logger.info(f"  final_state.tsk: '{final_state.get('tsk', 'NOT SET')}'")
+                logger.info(f"  final_state.step: {final_state.get('step', 'NOT SET')}")
+                logger.info(f"  final_state.history_steps count: {len(final_state.get('history_steps', []))}")
+                logger.info(f"  final_state.app_name: '{final_state.get('app_name', 'NOT SET')}'")
+            else:
+                logger.error("  final_state is None!")
+            final_state_queue.put(final_state)
+        except Exception as e:
+            logger.exception(f"run_exploration EXCEPTION: {e}")
+            final_state_queue.put(None)
 
     # Start the exploration task in a new thread
+    logger.info("Starting exploration thread...")
     t = threading.Thread(target=run_exploration)
     t.start()
 
     # Continuously get status updates from the queue
+    logger.info("Waiting for exploration thread...")
     while t.is_alive() or not q.empty():
         try:
             msg, pages = q.get(timeout=1)
@@ -129,15 +209,24 @@ def auto_exploration():
         except:
             pass
 
+    logger.info("Exploration thread finished")
     auto_log_storage.append("Exploration finished.")
 
     # Get the final state from the queue
     try:
         final_state = final_state_queue.get(timeout=5)  # Wait for the final state
+        logger.info("Got final_state from queue")
+        if final_state:
+            logger.info(f"  final_state.tsk: '{final_state.get('tsk', 'NOT SET')}'")
+            logger.info(f"  final_state.history_steps: {len(final_state.get('history_steps', []))}")
+        else:
+            logger.error("  final_state is None!")
         # Convert the result to JSON format and store it
         state2json_result = state2json(final_state)
+        logger.info(f"state2json result: {state2json_result}")
         auto_log_storage.append(state2json_result)
-    except:
+    except Exception as e:
+        logger.exception(f"Failed to get final state: {e}")
         auto_log_storage.append("Error: Failed to get final state")
 
     yield "\n".join(auto_log_storage), auto_page_storage
@@ -1173,8 +1262,8 @@ with gr.Blocks(
                         label="Execution Process Screenshots", columns=2, height=400
                     )
 
-            # Import deployment module
-            from deployment import run_task
+            # Import deployment module (renamed to avoid collision with explor_auto.run_task)
+            from deployment import run_task as deployment_run_task
 
             # Refresh device list
             def update_execution_devices():
@@ -1264,8 +1353,8 @@ with gr.Blocks(
                     # Execute task in background thread
                     def run_in_background():
                         try:
-                            # Modify run_task function to support callback
-                            original_run_task = run_task
+                            # Modify deployment_run_task function to support callback
+                            original_run_task = deployment_run_task
 
                             def patched_run_task(task, device):
                                 # Here, we can modify run_task function behavior, adding callback support
@@ -1289,7 +1378,7 @@ with gr.Blocks(
 
                             # Execute task
                             add_log("Starting task execution process...")
-                            result = run_task(task_description, device)
+                            result = deployment_run_task(task_description, device)
 
                             # Restore original function
                             deployment.run_task = original_run_task

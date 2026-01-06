@@ -2,3 +2,16 @@
 .idea/
 **/__pycache__
 /log/
+venv/
+.DS_Store
+
+# Ignore markdown files except README
+*.md
+!README.md
+
+# Model weights - too large for git
+backend/OmniParser/weights/
+
+# Secrets - NEVER commit these
+app_secrets.py
+.env

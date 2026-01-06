@@ -18,17 +18,23 @@ import numpy as np
 # %matplotlib inline
 from matplotlib import pyplot as plt
 import easyocr
-from paddleocr import PaddleOCR
 reader = easyocr.Reader(['en'])
-paddle_ocr = PaddleOCR(
-    lang='en',  # other lang also available
-    use_angle_cls=False,
-    use_gpu=False,  # using cuda will conflict with pytorch in the same process
-    show_log=False,
-    max_batch_size=1024,
-    use_dilation=True,  # improves accuracy
-    det_db_score_mode='slow',  # improves accuracy
-    rec_batch_num=1024)
+
+# PaddleOCR is optional - use easyocr as fallback if not available
+paddle_ocr = None
+try:
+    from paddleocr import PaddleOCR
+    paddle_ocr = PaddleOCR(
+        lang='en',
+        use_angle_cls=False,
+        use_gpu=False,
+        show_log=False,
+        max_batch_size=1024,
+        use_dilation=True,
+        det_db_score_mode='slow',
+        rec_batch_num=1024)
+except ImportError:
+    print("PaddleOCR not available, using EasyOCR only")
 import time
 import base64
 
@@ -58,19 +64,30 @@ def get_caption_model_processor(model_name, model_name_or_path="Salesforce/blip2
             model_name_or_path, device_map=None, torch_dtype=torch.float16
         ).to(device)
     elif model_name == "florence2":
-        from transformers import AutoProcessor, AutoModelForCausalLM 
+        from transformers import AutoProcessor, AutoModelForCausalLM
         processor = AutoProcessor.from_pretrained("microsoft/Florence-2-base", trust_remote_code=True)
+        # Use eager attention implementation for compatibility with local model weights
         if device == 'cpu':
-            model = AutoModelForCausalLM.from_pretrained(model_name_or_path, torch_dtype=torch.float32, trust_remote_code=True)
+            model = AutoModelForCausalLM.from_pretrained(model_name_or_path, torch_dtype=torch.float32, trust_remote_code=True, attn_implementation="eager")
         else:
-            model = AutoModelForCausalLM.from_pretrained(model_name_or_path, torch_dtype=torch.float16, trust_remote_code=True).to(device)
+            model = AutoModelForCausalLM.from_pretrained(model_name_or_path, torch_dtype=torch.float16, trust_remote_code=True, attn_implementation="eager").to(device)
     return {'model': model.to(device), 'processor': processor}
 
 
 def get_yolo_model(model_path):
     from ultralytics import YOLO
-    # Load the model.
-    model = YOLO(model_path)
+    # PyTorch 2.6+ defaults to weights_only=True for security.
+    # The YOLO model weights were saved in an older format that requires weights_only=False.
+    # This is safe since we trust the OmniParser model weights from HuggingFace.
+    original_load = torch.load
+    def patched_load(*args, **kwargs):
+        kwargs['weights_only'] = False
+        return original_load(*args, **kwargs)
+    torch.load = patched_load
+    try:
+        model = YOLO(model_path)
+    finally:
+        torch.load = original_load  # Restore original behavior
     return model
 
 

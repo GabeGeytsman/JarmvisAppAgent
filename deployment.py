@@ -1,8 +1,8 @@
 import time
 from typing import Any, Optional, Tuple
 
-from langchain.prompts import ChatPromptTemplate
-from langchain.schema.messages import HumanMessage, SystemMessage
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.output_parsers import JsonOutputParser, StrOutputParser
 from langchain_openai import ChatOpenAI
 from langgraph.graph import StateGraph, END
@@ -13,6 +13,8 @@ from data.graph_db import Neo4jDatabase
 from data.vector_db import VectorStore
 from tool.img_tool import *
 from tool.screen_content import *
+from device import ADBController
+from tool.screen_content import set_controller
 
 os.environ["LANGCHAIN_TRACING_V2"] = config.LANGCHAIN_TRACING_V2
 os.environ["LANGCHAIN_ENDPOINT"] = config.LANGCHAIN_ENDPOINT
@@ -943,6 +945,10 @@ def run_task(task: str, device: str = "emulator-5554") -> Dict[str, Any]:
     print(f"🚀 Starting task execution: {task}")
 
     try:
+        # Initialize and set the device controller
+        controller = ADBController(device_id=device)
+        set_controller(controller)
+
         # Initialize state using create_deployment_state function
         from data.State import create_deployment_state
 
@@ -950,6 +956,7 @@ def run_task(task: str, device: str = "emulator-5554") -> Dict[str, Any]:
             task=task,
             device=device,
             max_retries=3,
+            controller=controller,
         )
 
         # Execute task using LangGraph workflow
