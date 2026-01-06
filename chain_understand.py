@@ -5,7 +5,7 @@ from langchain_core.runnables import RunnablePassthrough
 from pydantic import BaseModel, Field, SecretStr
 import json
 import os
-from langchain_openai import ChatOpenAI
+from langchain_anthropic import ChatAnthropic
 from data.graph_db import Neo4jDatabase
 import config
 
@@ -14,11 +14,10 @@ os.environ["LANGCHAIN_ENDPOINT"] = config.LANGCHAIN_ENDPOINT
 os.environ["LANGCHAIN_API_KEY"] = config.LANGCHAIN_API_KEY
 os.environ["LANGCHAIN_PROJECT"] = "LearnTriplet"  # Keep specific project name
 
-model = ChatOpenAI(
-    openai_api_base=config.LLM_BASE_URL,
-    openai_api_key=SecretStr(config.LLM_API_KEY),
+model = ChatAnthropic(
+    api_key=SecretStr(config.ANTHROPIC_API_KEY),
     model_name=config.LLM_MODEL,
-    request_timeout=config.LLM_REQUEST_TIMEOUT,
+    timeout=config.LLM_REQUEST_TIMEOUT,
     max_retries=config.LLM_MAX_RETRIES,
     max_tokens=config.LLM_MAX_TOKEN,
 )

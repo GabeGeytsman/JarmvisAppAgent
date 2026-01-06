@@ -5,7 +5,7 @@ from typing import List, Dict, Any, Optional, Tuple
 from langchain_core.output_parsers import JsonOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import RunnablePassthrough
-from langchain_openai import ChatOpenAI
+from langchain_anthropic import ChatAnthropic
 from pydantic import BaseModel, Field, SecretStr
 import config
 from data.graph_db import Neo4jDatabase
@@ -17,11 +17,10 @@ os.environ["LANGCHAIN_API_KEY"] = config.LANGCHAIN_API_KEY
 os.environ["LANGCHAIN_PROJECT"] = "ChainEvolve"
 
 # Initialize LLM model
-model = ChatOpenAI(
-    openai_api_base=config.LLM_BASE_URL,
-    openai_api_key=SecretStr(config.LLM_API_KEY),
+model = ChatAnthropic(
+    api_key=SecretStr(config.ANTHROPIC_API_KEY),
     model_name=config.LLM_MODEL,
-    request_timeout=config.LLM_REQUEST_TIMEOUT,
+    timeout=config.LLM_REQUEST_TIMEOUT,
     max_retries=config.LLM_MAX_RETRIES,
     max_tokens=2000,
 )

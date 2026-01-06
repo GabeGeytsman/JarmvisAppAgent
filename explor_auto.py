@@ -1,6 +1,6 @@
 import logging
 from langchain_core.messages import HumanMessage, SystemMessage
-from langchain_openai import ChatOpenAI
+from langchain_anthropic import ChatAnthropic
 from langgraph.graph import StateGraph, START, END
 from langgraph.prebuilt import create_react_agent
 from langgraph.types import RetryPolicy
@@ -11,16 +11,43 @@ from tool.screen_content import *
 # Setup logging
 logger = logging.getLogger(__name__)
 
+
+def extract_text_content(content):
+    """
+    Extract text from Claude's message content.
+    Claude can return content as either:
+    - A string (simple text response)
+    - A list of content blocks like [{"type": "text", "text": "..."}]
+
+    Args:
+        content: Message content (string or list)
+
+    Returns:
+        Extracted text as a string
+    """
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        text_parts = []
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                text_parts.append(block.get("text", ""))
+            elif isinstance(block, str):
+                text_parts.append(block)
+        return " ".join(text_parts).strip()
+    return str(content).strip()
+
 os.environ["LANGCHAIN_TRACING_V2"] = config.LANGCHAIN_TRACING_V2
 os.environ["LANGCHAIN_ENDPOINT"] = config.LANGCHAIN_ENDPOINT
 os.environ["LANGCHAIN_API_KEY"] = config.LANGCHAIN_API_KEY
 os.environ["LANGCHAIN_PROJECT"] = config.LANGCHAIN_PROJECT
 
-model = ChatOpenAI(
-    openai_api_base=config.LLM_BASE_URL,
-    openai_api_key=SecretStr(config.LLM_API_KEY),
+model = ChatAnthropic(
+    api_key=SecretStr(config.ANTHROPIC_API_KEY),
     model_name=config.LLM_MODEL,
-    request_timeout=config.LLM_REQUEST_TIMEOUT,
+    timeout=config.LLM_REQUEST_TIMEOUT,
     max_retries=config.LLM_MAX_RETRIES,
     max_tokens=config.LLM_MAX_TOKEN,
 )
@@ -35,7 +62,7 @@ def tsk_setting(state: State):
         ),
     ]
     llm_response = model.invoke(message)
-    app_name = llm_response.content
+    app_name = extract_text_content(llm_response.content)
     state["app_name"] = app_name
     state["context"] = [
         HumanMessage(
@@ -72,6 +99,7 @@ def page_understand(state: State):
             "device": state["device"],
             "app_name": state["app_name"],
             "step": state["step"],
+            "task_id": state.get("task_id"),
         }
     )
     screen_result = screen_element.invoke(
@@ -81,17 +109,23 @@ def page_understand(state: State):
     )
     state["current_page_screenshot"] = screen_img
     state["current_page_json"] = screen_result["parsed_content_json_path"]
-    # Call the callback function (if any)
-    if state.get("callback"):
-        state["callback"](state, node_name="page_understand")
 
-    # Add tool result to state
+    # Add tool result to state BEFORE calling callback so screenshots are available
     if not isinstance(state["tool_results"], list):
         state["tool_results"] = []
 
     state["tool_results"].append(
         {"tool_name": "screen_element", "result": screen_result}
     )
+
+    # Call the callback function (if any) - AFTER tool_results are updated
+    if state.get("callback"):
+        callback_info = {
+            "labeled_image_path": screen_result.get("labeled_image_path"),
+            "step": state["step"],
+            "message": f"📷 Step {state['step']}: Captured and analyzed screenshot",
+        }
+        state["callback"](state, node_name="page_understand", info=callback_info)
 
     return state
 
@@ -120,10 +154,25 @@ def perform_action(state: State):
     device = state.get("device", "Unknown device")
     device_size = state.get("device_info", {})
 
+    # Helper function to detect image media type
+    def get_image_media_type(file_path):
+        ext = os.path.splitext(file_path)[1].lower()
+        if ext == '.png':
+            return 'image/png'
+        elif ext in ['.jpg', '.jpeg']:
+            return 'image/jpeg'
+        elif ext == '.gif':
+            return 'image/gif'
+        elif ext == '.webp':
+            return 'image/webp'
+        else:
+            return 'image/png'  # Default to PNG
+
     # Read screenshot file and encode to base64
     with open(labeled_image_path, "rb") as f:
         image_content = f.read()
     image_data = base64.b64encode(image_content).decode("utf-8")
+    image_media_type = get_image_media_type(labeled_image_path)
 
     # Read parsed JSON file content
     with open(json_labeled_path, "r", encoding="utf-8") as f:
@@ -132,8 +181,27 @@ def perform_action(state: State):
     # Build message list to pass to LLM, including user intent, page parsed result, and screenshot information
     messages = [
         SystemMessage(
-            content=f"Below is the current page information and user intent, please analyze and recommend a reasonable next step based on this. Please only complete one step."
-            f"All tool calls must include device to specify the operation device."
+            content="""You are an AI agent controlling a mobile device. Analyze the current screen and determine the SINGLE next action to take.
+
+IMPORTANT RULES:
+1. THINK STEP-BY-STEP: Before acting, explain what you see on screen and why you're taking this action.
+2. ONE ACTION AT A TIME: Only perform ONE action per turn.
+3. TAP BEFORE TYPING: You MUST tap on a text input field to focus it BEFORE you can type text into it. Never use the "text" action unless you have already tapped on an input field in a PREVIOUS step.
+4. VERIFY FOCUS: If you need to enter text, first tap the input field. Only type text AFTER confirming the field is focused.
+5. BE PRECISE: Use the element IDs and bounding boxes to calculate exact tap coordinates.
+
+TASK COMPLETION:
+- If you believe the task has been FULLY completed (the intended outcome is visible on screen), include "TASK_COMPLETE: YES" at the END of your response.
+- Only signal completion when the FINAL desired outcome is achieved, not intermediate steps.
+- If you're still working toward the goal, do NOT include any TASK_COMPLETE signal.
+
+FORMAT YOUR RESPONSE:
+- First, describe what you observe on the current screen
+- Then, explain your reasoning for the next action
+- Execute the action using the appropriate tool
+- If task is done, end with: TASK_COMPLETE: YES
+
+All tool calls must include device to specify the operation device. Only execute one tool call."""
         ),
         HumanMessage(
             content=f"The current device is: {device}, the screen size of the device is {device_size}."
@@ -151,7 +219,7 @@ def perform_action(state: State):
                 },
                 {
                     "type": "image_url",
-                    "image_url": {"url": f"data:image/jpeg;base64,{image_data}"},
+                    "image_url": {"url": f"data:{image_media_type};base64,{image_data}"},
                 },
             ],
         ),
@@ -178,9 +246,35 @@ def perform_action(state: State):
         )
         return state
 
-    # Extract recommended action and execution status from final_message
-    recommended_action = final_messages[-1].content.strip()
+    # Extract LLM reasoning - look for the AI message BEFORE tool execution
+    # Message flow: [input msgs...] -> AI (reasoning) -> Tool (result) -> AI (summary)
+    llm_reasoning = ""
+    ai_messages = [msg for msg in final_messages if msg.type == "ai"]
+    if ai_messages:
+        # First AI message contains the reasoning before tool call
+        first_ai_msg = ai_messages[0]
+        if hasattr(first_ai_msg, 'content') and first_ai_msg.content:
+            llm_reasoning = extract_text_content(first_ai_msg.content)
+        # If there's a second AI message, that's the summary after tool call
+        if len(ai_messages) > 1:
+            summary_msg = ai_messages[-1]
+            if hasattr(summary_msg, 'content') and summary_msg.content:
+                llm_reasoning += f"\n\n[After action]: {extract_text_content(summary_msg.content)}"
+
+    # Fallback to last message if no reasoning found
+    recommended_action = llm_reasoning if llm_reasoning else extract_text_content(final_messages[-1].content)
     state["recommend_action"] = recommended_action
+
+    # Check if agent signals task completion
+    agent_signals_complete = False
+    for msg in ai_messages:
+        if hasattr(msg, 'content') and msg.content:
+            msg_text = extract_text_content(msg.content).upper()
+            if "TASK_COMPLETE: YES" in msg_text or "TASK_COMPLETE:YES" in msg_text:
+                agent_signals_complete = True
+                logger.info("Action agent signaled TASK_COMPLETE: YES")
+                break
+    state["agent_signals_complete"] = agent_signals_complete
 
     # Parse all tool_messages to get tool execution results
     tool_messages = [msg for msg in final_messages if msg.type == "tool"]
@@ -210,41 +304,109 @@ def perform_action(state: State):
     # Update step counter
     state["step"] += 1
 
-    # Call callback
+    # Call callback with detailed action info
     if state.get("callback"):
-        state["callback"](state, node_name="perform_action")
+        # Format action details for display
+        action_details = ""
+        if tool_output:
+            action_type = tool_output.get("action", "unknown")
+            if action_type == "tap":
+                coords = tool_output.get("clicked_element", {})
+                action_details = f"🖱️ TAP at ({coords.get('x', '?')}, {coords.get('y', '?')})"
+            elif action_type == "text":
+                text = tool_output.get("input_str", "")
+                action_details = f"⌨️ TYPE: \"{text}\""
+            elif action_type == "swipe":
+                direction = tool_output.get("direction", "?")
+                action_details = f"👆 SWIPE {direction}"
+            elif action_type == "long_press":
+                coords = tool_output.get("long_press", {})
+                action_details = f"👆 LONG PRESS at ({coords.get('x', '?')}, {coords.get('y', '?')})"
+            elif action_type == "back":
+                action_details = "⬅️ BACK button pressed"
+            else:
+                action_details = f"Action: {action_type}"
+
+        callback_info = {
+            "step": state["step"] - 1,  # Show the step we just completed
+            "llm_reasoning": recommended_action,
+            "action_details": action_details,
+            "tool_output": tool_output,
+            "labeled_image_path": state.get("current_page_screenshot"),
+            "message": f"🤖 Step {state['step'] - 1}: {action_details}",
+        }
+        state["callback"](state, node_name="perform_action", info=callback_info)
 
     return state
 
 
 def tsk_completed(state: State):
     """
-    When the number of execution steps exceeds three, use LLM and the current history of three screenshots to determine if the task is complete.
-    It consists of two steps:
-    1. Use the user's task itself to reflect on the completion criteria (generate a description of the completion criteria using LLM)
-    2. Use the three screenshots and the completion criteria generated in the first step to ask LLM to judge whether the task is completed.
+    Check if the task is complete. Only invokes the judge LLM when:
+    1. The action agent signals task completion (TASK_COMPLETE: YES), OR
+    2. The safety limit is reached (step > 20)
+
+    This optimization avoids wasting API calls by checking every step.
     """
 
-    # If step is less than 4, no judgment is made - allow more steps before checking completion
-    if state["step"] < 4:
+    # Allow at least 2 steps before any completion check
+    if state["step"] < 2:
         return state["completed"]
+
+    # Check if agent signaled completion
+    agent_signals_complete = state.get("agent_signals_complete", False)
+
+    # Only invoke judge LLM if agent signals completion OR safety limit reached
+    if not agent_signals_complete and state["step"] <= 20:
+        # Agent hasn't signaled completion and we're under safety limit - continue working
+        logger.info(f"Step {state['step']}: Agent has not signaled completion, continuing...")
+        return False
+
+    if state["step"] > 20:
+        logger.warning(f"Step {state['step']}: Safety limit reached, invoking judge")
+    else:
+        logger.info(f"Step {state['step']}: Agent signaled TASK_COMPLETE, invoking judge to verify")
+
+    logger.info(f"TASK COMPLETION CHECK at step {state['step']}")
 
     # Get user task description
     user_task = state.get("tsk", "No task description")
 
+    # FIRST: Take a fresh screenshot BEFORE judgment to see current state
+    logger.info("Taking fresh screenshot for judgment...")
+    current_screen_img = take_screenshot.invoke(
+        {
+            "device": state["device"],
+            "app_name": state["app_name"],
+            "step": state["step"],
+            "task_id": state.get("task_id"),
+        }
+    )
+    current_screen_result = screen_element.invoke(
+        {
+            "image_path": current_screen_img,
+        }
+    )
+    state["current_page_screenshot"] = current_screen_img
+    state["current_page_json"] = current_screen_result["parsed_content_json_path"]
+
     # First step: let LLM reflect on user task, generate task completion judgment criteria
     reflection_messages = [
         SystemMessage(
-            content="You are a supportive intelligent assistant, helping to analyze task completion criteria."
+            content="You are a task completion analyst. Generate SPECIFIC, VERIFIABLE criteria for determining when a task is fully complete."
         ),
         HumanMessage(
-            content=f"The user's task is: {user_task}\nPlease describe clear and checkable task completion criteria. For example: 'When a certain element or status appears on the page, it indicates that the task is completed.'"
+            content=f"The user's task is: {user_task}\n\n"
+            f"What is the user's INTENDED OUTCOME? What would success look like?\n"
+            f"Generate clear completion criteria - describe what MUST be visible on screen to confirm the task achieved its intended result.\n"
+            f"Focus on the FINAL outcome, not intermediate steps."
         ),
     ]
 
     # Call LLM to generate completion criteria
     reflection_response = model.invoke(reflection_messages)
-    completion_criteria = reflection_response.content.strip()
+    completion_criteria = extract_text_content(reflection_response.content)
+    logger.info(f"Generated completion criteria: {completion_criteria[:200]}...")
 
     # Add generated completion criteria to context
     state["context"].append(
@@ -253,110 +415,139 @@ def tsk_completed(state: State):
         )
     )
 
-    # Second step: use the latest three page screenshots and completion criteria to ask LLM to judge
-    # Ensure enough screenshot history
-    if len(state["page_history"]) < 3:
-        # If not enough three screenshots, use as many existing screenshots as possible.
-        # But logically >=3 steps should at least have 3 times page_understand screenshots, here for safety make downgrade processing.
-        recent_images = state["page_history"]
-    else:
-        recent_images = state["page_history"][-3:]
+    # Second step: use the CURRENT screenshot plus recent history for judgment
+    # Include the fresh screenshot we just took as the MOST RECENT
+    recent_images = []
 
-    # Convert three screenshots to base64 and package as LLM messages
+    # Add 2 previous screenshots from history if available
+    if len(state["page_history"]) >= 2:
+        recent_images = state["page_history"][-2:]
+    elif len(state["page_history"]) >= 1:
+        recent_images = state["page_history"][-1:]
+
+    # Add the CURRENT fresh screenshot as the final (most recent) image
+    recent_images.append(current_screen_img)
+
+    # Helper function to detect image media type
+    def get_image_media_type(file_path):
+        ext = os.path.splitext(file_path)[1].lower()
+        if ext == '.png':
+            return 'image/png'
+        elif ext in ['.jpg', '.jpeg']:
+            return 'image/jpeg'
+        elif ext == '.gif':
+            return 'image/gif'
+        elif ext == '.webp':
+            return 'image/webp'
+        else:
+            return 'image/png'  # Default to PNG
+
+    # Convert screenshots to base64 and package as LLM messages
     image_messages = []
     for idx, img_path in enumerate(recent_images, start=1):
+        label = "CURRENT STATE" if idx == len(recent_images) else f"Previous screenshot {idx}"
         if os.path.exists(img_path):
             with open(img_path, "rb") as f:
                 img_data = base64.b64encode(f.read()).decode("utf-8")
+            img_media_type = get_image_media_type(img_path)
             image_messages.append(
                 HumanMessage(
                     content=[
                         {
                             "type": "text",
-                            "text": f"Below is the base64 data of the {idx}th screenshot:",
+                            "text": f"Screenshot {idx} ({label}):",
                         },
                         {
                             "type": "image_url",
-                            "image_url": {"url": f"data:image/jpeg;base64,{img_data}"},
+                            "image_url": {"url": f"data:{img_media_type};base64,{img_data}"},
                         },
                     ]
                 )
             )
         else:
-            # If path does not exist, send a descriptive text
             image_messages.append(
                 HumanMessage(
-                    content=f"Cannot find the {idx}th screenshot path: {img_path}"
+                    content=f"Cannot find screenshot path: {img_path}"
                 )
             )
 
-    # Build final judgment dialog information
+    # Build final judgment dialog information - TASK AGNOSTIC
     judgement_messages = [
         SystemMessage(
-            content="You are a strict task completion judge. You must verify that ALL parts of the user's task have been completed, not just partial completion. Only answer 'yes' or 'complete' if the ENTIRE task is done."
+            content="""You are a strict task completion judge. Evaluate whether the user's intended task has been FULLY accomplished based on what is visible on screen.
+
+KEY PRINCIPLES:
+1. Consider the user's INTENT, not just the literal words. What outcome were they trying to achieve?
+2. Distinguish between INTERMEDIATE states and FINAL outcomes. A task is only complete when the intended result is achieved.
+3. If an action was initiated but not yet executed/confirmed, the task is NOT complete.
+4. Partial completion is NOT completion. ALL parts of a multi-step task must be done.
+5. Look at the CURRENT STATE screenshot carefully - does it show the expected end result?
+
+You must provide your reasoning FIRST, then give your final answer.
+Format your response as:
+REASONING: [Your detailed analysis of what you see on the current screen and whether it shows the intended outcome was achieved]
+VERDICT: [yes/no]"""
         ),
         HumanMessage(
-            content=f"Original task: {user_task}\n\n"
-            f"Completion criteria: {completion_criteria}\n\n"
-            f"Based on the following screenshots, determine if the ENTIRE task is complete. "
-            f"If the task has multiple parts (e.g., 'open app AND do something'), ALL parts must be done. "
-            f"If you see a dialog, popup, or intermediate screen that requires user action before the task can continue, answer 'no'. "
-            f"Only answer 'yes' or 'complete' if you can clearly see the final expected result of the task."
+            content=f"TASK: {user_task}\n\n"
+            f"COMPLETION CRITERIA: {completion_criteria}\n\n"
+            f"Analyze the screenshots (especially the CURRENT STATE - the last screenshot).\n"
+            f"Ask yourself: Does the screen show that the user's intended outcome was achieved? Or is it still in an intermediate state?"
         ),
     ] + image_messages
 
     # Call LLM for final judgment
     judgement_response = model.invoke(judgement_messages)
-    judgement_answer = judgement_response.content.strip()
+    judgement_answer = extract_text_content(judgement_response.content)
 
-    # Update state["completed"] based on LLM's answer
-    # Assuming LLM answers "yes" or "no", of course, it can be conditionally adapted based on actual model output
-    if "yes" in judgement_answer or "complete" in judgement_answer.lower():
-        # state["current_page_screenshot"] = None
-        state["completed"] = True
-        screen_img = take_screenshot.invoke(
-            {
-                "device": state["device"],
-                "app_name": state["app_name"],
-                "step": state["step"],
-            }
-        )
-        screen_result = screen_element.invoke(
-            {
-                "image_path": screen_img,
-            }
-        )
-        state["current_page_screenshot"] = screen_img
-        state["current_page_json"] = screen_result["parsed_content_json_path"]
-    else:
-        state["completed"] = False
+    logger.info(f"JUDGE LLM RESPONSE:\n{judgement_answer}")
+
+    # Parse the verdict from the response
+    verdict_completed = False
+    if "VERDICT:" in judgement_answer.upper():
+        verdict_part = judgement_answer.upper().split("VERDICT:")[-1].strip()
+        if verdict_part.startswith("YES"):
+            verdict_completed = True
+    elif "yes" in judgement_answer.lower() and "no" not in judgement_answer.lower():
+        # Fallback for responses without proper format
+        verdict_completed = True
+
+    # Update state
+    state["completed"] = verdict_completed
+
+    # Call callback to log the judgment to UI
+    if state.get("callback"):
+        state["callback"](state, node_name="task_judgment", info={
+            "step": state["step"],
+            "message": f"🔍 Task Completion Check",
+            "completion_criteria": completion_criteria,
+            "judge_reasoning": judgement_answer,
+            "verdict": "COMPLETE" if verdict_completed else "NOT COMPLETE",
+            "screenshot_path": current_screen_img,
+        })
 
     # Add final judgment to context
     state["context"].append(
         SystemMessage(
-            content=f"LLM's answer on whether the task is completed: {judgement_answer}"
+            content=f"Judge LLM reasoning and verdict: {judgement_answer}"
         )
     )
     state["context"].append(
         SystemMessage(content=f"Final task completion status: {state['completed']}")
     )
 
-    if state["step"] > 20:  # Safety limit to prevent infinite loops
-        screen_img = take_screenshot.invoke(
-            {
-                "device": state["device"],
-                "app_name": state["app_name"],
+    # Safety limit to prevent infinite loops
+    if state["step"] > 20:
+        logger.warning("Hit 20 step safety limit - forcing completion")
+        state["completed"] = True
+        if state.get("callback"):
+            state["callback"](state, node_name="task_judgment", info={
                 "step": state["step"],
-            }
-        )
-        screen_result = screen_element.invoke(
-            {
-                "image_path": screen_img,
-            }
-        )
-        state["current_page_screenshot"] = screen_img
-        state["current_page_json"] = screen_result["parsed_content_json_path"]
+                "message": "⚠️ Hit 20 step safety limit - forcing task end",
+                "verdict": "FORCED COMPLETE (step limit)",
+            })
         return True
+
     return state["completed"]
 
 

@@ -70,12 +70,13 @@ def get_adb_devices():
     return devices if devices else ["No devices found"]
 
 
-def initialize_device(device, task_info):
+def initialize_device(device, task_info, save_screenshots=True):
     global temp_state
     logger.info("="*40)
     logger.info("INITIALIZE_DEVICE called")
     logger.info(f"  device param: '{device}'")
     logger.info(f"  task_info param: '{task_info}'")
+    logger.info(f"  save_screenshots: {save_screenshots}")
     logger.info("="*40)
 
     if not task_info:
@@ -84,6 +85,10 @@ def initialize_device(device, task_info):
     if not device or device == "No devices found":
         logger.error("INIT FAILED: no valid device")
         return "Error: Please select a valid ADB device."
+
+    # Generate unique task ID (timestamp-based)
+    task_id = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    logger.info(f"Generated task_id: {task_id}")
 
     # Create and set the device controller
     logger.info(f"Creating ADBController for device: {device}")
@@ -96,9 +101,12 @@ def initialize_device(device, task_info):
     logger.info(f"Device size: {device_size}")
 
     temp_state = State(
+        task_id=task_id,
+        save_screenshots=save_screenshots,
         tsk=task_info,
         app_name="",
         completed=False,
+        agent_signals_complete=False,
         step=0,
         history_steps=[],
         page_history=[],
@@ -116,13 +124,34 @@ def initialize_device(device, task_info):
         callback=None,
     )
 
+    # Create task folder and save metadata
+    task_folder = f"./log/tasks/{task_id}"
+    os.makedirs(task_folder, exist_ok=True)
+    os.makedirs(f"{task_folder}/screenshots", exist_ok=True)
+
+    # Save task metadata
+    task_metadata = {
+        "task_id": task_id,
+        "task_description": task_info,
+        "device": device,
+        "device_info": device_size,
+        "save_screenshots": save_screenshots,
+        "created_at": datetime.datetime.now().isoformat(),
+        "status": "initialized"
+    }
+    with open(f"{task_folder}/task_meta.json", "w") as f:
+        json.dump(task_metadata, f, indent=2)
+
+    logger.info(f"Task folder created: {task_folder}")
+
     logger.info("temp_state created successfully:")
+    logger.info(f"  task_id: '{temp_state.get('task_id', 'NOT SET')}'")
     logger.info(f"  tsk: '{temp_state.get('tsk', 'NOT SET')}'")
     logger.info(f"  device: '{temp_state.get('device', 'NOT SET')}'")
     logger.info(f"  controller: {temp_state.get('controller', 'NOT SET')}")
     logger.info(f"  step: {temp_state.get('step', 'NOT SET')}")
 
-    return f"Device: {device}, Task Info: {task_info} initialized."
+    return f"Task ID: {task_id}\nDevice: {device}\nTask: {task_info}\nSave Screenshots: {save_screenshots}"
 
 
 def auto_exploration():
@@ -132,11 +161,15 @@ def auto_exploration():
     logger.info("AUTO_EXPLORATION called")
     logger.info("="*60)
 
+    # Helper function to get current timestamp with timezone and AM/PM
+    def get_timestamp():
+        return datetime.datetime.now().astimezone().strftime("%I:%M:%S %p %Z")
+
     if not temp_state:
         logger.error("AUTO_EXPLORATION: temp_state is None!")
         logger.error("User did not initialize device/task first")
-        auto_log_storage.append("Error: Please initialize device and task info first.")
-        yield "\n".join(auto_log_storage), auto_page_storage
+        auto_log_storage.append(f"[{get_timestamp()}] Error: Please initialize device and task info first.")
+        yield "\n".join(auto_log_storage), auto_page_storage, gr.update(value="Start Exploration", interactive=True)
         return
 
     # Log the temp_state before exploration
@@ -149,21 +182,103 @@ def auto_exploration():
     logger.info(f"  completed: {temp_state.get('completed', 'NOT SET')}")
     logger.info(f"  history_steps count: {len(temp_state.get('history_steps', []))}")
 
+    # Mark exploration as in progress
+    exploration_start_time = datetime.datetime.now()
+    auto_log_storage.append(f"[{get_timestamp()}] 🚀 Exploration started")
+    yield "\n".join(auto_log_storage), auto_page_storage, gr.update(value="⏳ Exploration in Progress...", interactive=False)
+
     q = Queue()
     final_state_queue = Queue()
 
     def callback(state, node_name=None, info=None):
+        timestamp = get_timestamp()
         logger.info(f"CALLBACK: node={node_name}, step={state.get('step')}")
-        auto_log_storage.append("--" * 10)
-        auto_log_storage.append(
-            f"Current execution step: {state['step']}, Completed node: {node_name}"
-        )
-        if info and isinstance(info, dict):
-            auto_log_storage.append("Additional information:")
-            for k, v in info.items():
-                auto_log_storage.append(f"   {k}: {v}")
-                logger.info(f"  CALLBACK info: {k}={v}")
+        auto_log_storage.append("")
+        auto_log_storage.append("=" * 50)
 
+        if info and isinstance(info, dict):
+            # Display step and action details prominently
+            step_num = info.get("step", state.get("step", "?"))
+
+            if node_name == "page_understand":
+                auto_log_storage.append(f"[{timestamp}] 📷 STEP {step_num}: Screen Analysis")
+                auto_log_storage.append("-" * 30)
+                if info.get("message"):
+                    auto_log_storage.append(info["message"])
+
+            elif node_name == "perform_action":
+                action_details = info.get("action_details", "Unknown action")
+                auto_log_storage.append(f"[{timestamp}] 🤖 STEP {step_num}: Executing Action")
+                auto_log_storage.append("-" * 30)
+                auto_log_storage.append(f"ACTION: {action_details}")
+                auto_log_storage.append("")
+
+                # Display LLM reasoning prominently
+                llm_reasoning = info.get("llm_reasoning", "")
+                if llm_reasoning:
+                    auto_log_storage.append("💭 LLM REASONING:")
+                    # Wrap long reasoning text
+                    for line in llm_reasoning.split('\n'):
+                        if line.strip():
+                            auto_log_storage.append(f"   {line.strip()}")
+                    auto_log_storage.append("")
+
+            elif node_name == "tsk_setting":
+                auto_log_storage.append(f"[{timestamp}] ⚙️ Task Setup")
+                auto_log_storage.append("-" * 30)
+                auto_log_storage.append(f"Task: {info.get('task', 'N/A')}")
+                auto_log_storage.append(f"App: {info.get('app_name', 'N/A')}")
+
+            elif node_name == "task_judgment":
+                auto_log_storage.append(f"[{timestamp}] 🔍 STEP {step_num}: Task Completion Check")
+                auto_log_storage.append("-" * 30)
+
+                # Show completion criteria
+                criteria = info.get("completion_criteria", "")
+                if criteria:
+                    auto_log_storage.append("📋 COMPLETION CRITERIA:")
+                    for line in criteria.split('\n')[:5]:  # Limit to 5 lines
+                        if line.strip():
+                            auto_log_storage.append(f"   {line.strip()}")
+                    auto_log_storage.append("")
+
+                # Show judge reasoning (the important part!)
+                judge_reasoning = info.get("judge_reasoning", "")
+                if judge_reasoning:
+                    auto_log_storage.append("⚖️ JUDGE LLM ANALYSIS:")
+                    for line in judge_reasoning.split('\n'):
+                        if line.strip():
+                            auto_log_storage.append(f"   {line.strip()}")
+                    auto_log_storage.append("")
+
+                # Show verdict prominently
+                verdict = info.get("verdict", "UNKNOWN")
+                if "COMPLETE" in verdict and "NOT" not in verdict:
+                    auto_log_storage.append(f"✅ VERDICT: {verdict}")
+                else:
+                    auto_log_storage.append(f"❌ VERDICT: {verdict}")
+
+                # Add the judgment screenshot
+                screenshot_path = info.get("screenshot_path")
+                if screenshot_path and screenshot_path not in auto_page_storage:
+                    auto_page_storage.append(screenshot_path)
+                    logger.info(f"  CALLBACK: Added judgment screenshot: {screenshot_path}")
+
+            else:
+                auto_log_storage.append(f"[{timestamp}] Step {step_num}: {node_name}")
+                for k, v in info.items():
+                    if k not in ["llm_reasoning", "tool_output", "labeled_image_path", "judge_reasoning", "completion_criteria"]:
+                        auto_log_storage.append(f"   {k}: {v}")
+
+            # Add image from info directly if available
+            labeled_image = info.get("labeled_image_path")
+            if labeled_image and labeled_image not in auto_page_storage:
+                auto_page_storage.append(labeled_image)
+                logger.info(f"  CALLBACK: Added image from info: {labeled_image}")
+        else:
+            auto_log_storage.append(f"Step {state.get('step', '?')}: {node_name}")
+
+        # Also check tool_results for any images we might have missed
         if state.get("tool_results"):
             for tool_result in state["tool_results"]:
                 if isinstance(tool_result, dict):
@@ -172,7 +287,7 @@ def auto_exploration():
                         labeled_image = result.get("labeled_image_path")
                         if labeled_image and labeled_image not in auto_page_storage:
                             auto_page_storage.append(labeled_image)
-                            logger.info(f"  CALLBACK: Added image {labeled_image}")
+                            logger.info(f"  CALLBACK: Added image from tool_results: {labeled_image}")
 
         q.put(("\n".join(auto_log_storage), auto_page_storage))
 
@@ -205,12 +320,15 @@ def auto_exploration():
     while t.is_alive() or not q.empty():
         try:
             msg, pages = q.get(timeout=1)
-            yield msg, pages
+            yield msg, pages, gr.update(value="⏳ Exploration in Progress...", interactive=False)
         except:
             pass
 
     logger.info("Exploration thread finished")
-    auto_log_storage.append("Exploration finished.")
+    exploration_end_time = datetime.datetime.now()
+    elapsed = exploration_end_time - exploration_start_time
+    elapsed_str = str(elapsed).split('.')[0]  # Remove microseconds
+    auto_log_storage.append(f"[{get_timestamp()}] ✅ Exploration finished. Total time: {elapsed_str}")
 
     # Get the final state from the queue
     try:
@@ -219,6 +337,65 @@ def auto_exploration():
         if final_state:
             logger.info(f"  final_state.tsk: '{final_state.get('tsk', 'NOT SET')}'")
             logger.info(f"  final_state.history_steps: {len(final_state.get('history_steps', []))}")
+
+            # Update task metadata with final status
+            task_id = final_state.get('task_id')
+            if task_id:
+                task_folder = f"./log/tasks/{task_id}"
+                meta_file = f"{task_folder}/task_meta.json"
+                if os.path.exists(meta_file):
+                    with open(meta_file, "r") as f:
+                        task_metadata = json.load(f)
+                    task_metadata["status"] = "completed" if final_state.get("completed") else "incomplete"
+                    task_metadata["app_name"] = final_state.get("app_name", "")
+                    task_metadata["total_steps"] = final_state.get("step", 0)
+                    task_metadata["completed_at"] = datetime.datetime.now().isoformat()
+                    with open(meta_file, "w") as f:
+                        json.dump(task_metadata, f, indent=2)
+                    logger.info(f"Updated task metadata: {meta_file}")
+
+                    # Rename folder to include app_name if available
+                    app_name = final_state.get("app_name", "").strip()
+                    if app_name:
+                        new_folder = f"./log/tasks/{task_id}_{app_name}"
+                        if not os.path.exists(new_folder):
+                            import shutil
+                            old_folder = task_folder
+                            shutil.move(task_folder, new_folder)
+                            logger.info(f"Renamed task folder to: {new_folder}")
+                            task_folder = new_folder
+
+                            # Update all image paths in auto_page_storage to use new folder
+                            updated_pages = []
+                            for img_path in auto_page_storage:
+                                if old_folder in img_path:
+                                    new_path = img_path.replace(old_folder, new_folder)
+                                    updated_pages.append(new_path)
+                                    logger.info(f"Updated image path: {img_path} -> {new_path}")
+                                else:
+                                    # Handle relative paths like "log/tasks/..."
+                                    old_rel = f"log/tasks/{task_id}"
+                                    new_rel = f"log/tasks/{task_id}_{app_name}"
+                                    if old_rel in img_path:
+                                        new_path = img_path.replace(old_rel, new_rel)
+                                        updated_pages.append(new_path)
+                                        logger.info(f"Updated image path: {img_path} -> {new_path}")
+                                    else:
+                                        updated_pages.append(img_path)
+                            auto_page_storage.clear()
+                            auto_page_storage.extend(updated_pages)
+                            logger.info(f"Updated {len(updated_pages)} image paths after folder rename")
+
+                # Handle screenshot cleanup if disabled
+                save_screenshots = final_state.get("save_screenshots", True)
+                if not save_screenshots:
+                    screenshots_dir = f"{task_folder}/screenshots"
+                    if os.path.exists(screenshots_dir):
+                        import shutil
+                        shutil.rmtree(screenshots_dir)
+                        os.makedirs(screenshots_dir)  # Keep empty folder
+                        logger.info(f"Deleted screenshots (save_screenshots=False)")
+                        auto_log_storage.append("Screenshots deleted (retention disabled)")
         else:
             logger.error("  final_state is None!")
         # Convert the result to JSON format and store it
@@ -227,9 +404,9 @@ def auto_exploration():
         auto_log_storage.append(state2json_result)
     except Exception as e:
         logger.exception(f"Failed to get final state: {e}")
-        auto_log_storage.append("Error: Failed to get final state")
+        auto_log_storage.append(f"[{get_timestamp()}] Error: Failed to get final state")
 
-    yield "\n".join(auto_log_storage), auto_page_storage
+    yield "\n".join(auto_log_storage), auto_page_storage, gr.update(value="✅ Exploration Complete", interactive=False)
 
 
 def user_exploration(action, element_number, text_input, swipe_direction):
@@ -350,6 +527,11 @@ with gr.Blocks(
             task_info_input = gr.Textbox(
                 label="Set Task Information", placeholder="e.g., Task Description"
             )
+            save_screenshots_checkbox = gr.Checkbox(
+                label="Save screenshots after task completion",
+                value=True,
+                info="Uncheck to delete screenshots when task finishes (saves disk space)"
+            )
             init_button = gr.Button("Initialize")
             init_output = gr.Textbox(label="Initialization Output", interactive=False)
 
@@ -363,7 +545,7 @@ with gr.Blocks(
 
             init_button.click(
                 initialize_device,
-                inputs=[device_selector, task_info_input],
+                inputs=[device_selector, task_info_input, save_screenshots_checkbox],
                 outputs=[init_output],
             )
 
@@ -389,6 +571,7 @@ with gr.Blocks(
                 outputs=[
                     exploration_output,
                     screenshot_gallery_auto,
+                    explore_button,
                 ],
                 queue=True,
                 api_name="explore",
@@ -1279,156 +1462,203 @@ with gr.Blocks(
                 device, task_description, progress=gr.Progress()
             ):
                 if not device or device == "No devices found":
-                    return (
+                    yield (
                         "Error: Please select a valid device",
                         "Execution failed: No valid device selected",
                         [],
                     )
+                    return
 
                 if not task_description or task_description.strip() == "":
-                    return (
+                    yield (
                         "Error: Please enter task description",
                         "Execution failed: Task description is empty",
                         [],
                     )
+                    return
 
-                # Create variable to store logs
+                # Create storage for logs and screenshots
                 logs = []
                 screenshots = []
+                update_queue = Queue()
+                result_queue = Queue()
 
-                # Update function for updating UI during execution
                 def add_log(message):
                     logs.append(message)
-                    return "\n".join(logs)
+
+                # Callback function that will be called by deployment module
+                def execution_callback(state, node_name=None, info=None):
+                    logger.info(f"DEPLOYMENT CALLBACK: node={node_name}")
+
+                    if info and isinstance(info, dict):
+                        step_num = info.get("step", state.get("current_step", "?"))
+
+                        # Handle different node types
+                        if node_name == "capture_screen":
+                            logs.append("")
+                            logs.append("=" * 50)
+                            logs.append(f"📸 STEP {step_num}: Screen Capture")
+                            logs.append("-" * 30)
+                            if info.get("message"):
+                                logs.append(info["message"])
+                            if info.get("elements_count"):
+                                logs.append(f"   Detected {info['elements_count']} UI elements")
+
+                            # Add screenshot
+                            screenshot_path = info.get("screenshot_path")
+                            if screenshot_path and screenshot_path not in screenshots:
+                                screenshots.append(screenshot_path)
+                                logger.info(f"  Added screenshot: {screenshot_path}")
+
+                        elif node_name == "react_capture":
+                            logs.append("")
+                            logs.append("=" * 50)
+                            logs.append(f"📸 STEP {step_num}: React Mode - Screen Capture")
+                            logs.append("-" * 30)
+                            if info.get("message"):
+                                logs.append(info["message"])
+
+                            screenshot_path = info.get("screenshot_path")
+                            if screenshot_path and screenshot_path not in screenshots:
+                                screenshots.append(screenshot_path)
+                                logger.info(f"  Added screenshot: {screenshot_path}")
+
+                        elif node_name == "react_action":
+                            logs.append("")
+                            logs.append("=" * 50)
+                            logs.append(f"🤖 STEP {step_num}: React Mode - Action")
+                            logs.append("-" * 30)
+
+                            action_details = info.get("action_details", "")
+                            if action_details:
+                                logs.append(f"ACTION: {action_details}")
+
+                            llm_reasoning = info.get("llm_reasoning", "")
+                            if llm_reasoning:
+                                logs.append("")
+                                logs.append("💭 LLM REASONING:")
+                                for line in llm_reasoning.split('\n')[:10]:  # Limit to 10 lines
+                                    if line.strip():
+                                        logs.append(f"   {line.strip()}")
+
+                            screenshot_path = info.get("screenshot_path")
+                            if screenshot_path and screenshot_path not in screenshots:
+                                screenshots.append(screenshot_path)
+
+                        elif node_name == "execute_action":
+                            logs.append("")
+                            logs.append("=" * 50)
+                            logs.append(f"🚀 STEP {step_num}: Execute Action")
+                            logs.append("-" * 30)
+                            if info.get("message"):
+                                logs.append(info["message"])
+
+                            screenshot_path = info.get("screenshot_path")
+                            if screenshot_path and screenshot_path not in screenshots:
+                                screenshots.append(screenshot_path)
+
+                        elif node_name == "fallback":
+                            logs.append("")
+                            logs.append("=" * 50)
+                            logs.append(f"⚠️ STEP {step_num}: Fallback Mode")
+                            logs.append("-" * 30)
+                            if info.get("message"):
+                                logs.append(info["message"])
+
+                            screenshot_path = info.get("screenshot_path")
+                            if screenshot_path and screenshot_path not in screenshots:
+                                screenshots.append(screenshot_path)
+
+                        else:
+                            # Generic handler for other node types
+                            logs.append(f"Step {step_num}: {node_name}")
+                            if info.get("message"):
+                                logs.append(f"   {info['message']}")
+
+                    # Signal that an update is available
+                    update_queue.put(("update", "\n".join(logs), list(screenshots)))
 
                 try:
-                    add_log(f"Starting task execution: '{task_description}'")
-                    add_log(f"Using device: {device}")
+                    add_log(f"🚀 Starting task execution: '{task_description}'")
+                    add_log(f"📱 Using device: {device}")
+                    add_log("")
                     progress(0.1, "Initializing execution environment...")
-
-                    # Create execution function callback
-                    def execution_callback(state, node_name=None, info=None):
-                        if node_name:
-                            add_log(f"Executing node: {node_name}")
-
-                        if info and isinstance(info, dict):
-                            for k, v in info.items():
-                                if k == "message":
-                                    add_log(f"Information: {v}")
-                                elif (
-                                    k == "labeled_image_path"
-                                    and v
-                                    and v not in screenshots
-                                ):
-                                    screenshots.append(v)
-
-                        # Extract screenshots from tool results if available
-                        if "tool_results" in state:
-                            for tool_result in state["tool_results"]:
-                                if (
-                                    isinstance(tool_result, dict)
-                                    and "result" in tool_result
-                                ):
-                                    result = tool_result["result"]
-                                    if (
-                                        isinstance(result, dict)
-                                        and "labeled_image_path" in result
-                                    ):
-                                        img_path = result["labeled_image_path"]
-                                        if img_path and img_path not in screenshots:
-                                            screenshots.append(img_path)
-                                            add_log(f"Captured screenshot: {img_path}")
-
-                        # Real-time UI update
-                        yield "\n".join(logs), "Executing...", screenshots
-
-                    # Set callback function
-                    import types
-                    import threading
-                    from queue import Queue
-
-                    # Create queue for thread communication
-                    update_queue = Queue()
 
                     # Execute task in background thread
                     def run_in_background():
                         try:
-                            # Modify deployment_run_task function to support callback
-                            original_run_task = deployment_run_task
+                            add_log("Initializing deployment workflow...")
+                            update_queue.put(("update", "\n".join(logs), list(screenshots)))
 
-                            def patched_run_task(task, device):
-                                # Here, we can modify run_task function behavior, adding callback support
-                                add_log("Initializing task execution...")
-                                result = original_run_task(task, device)
+                            # Call deployment_run_task with the callback
+                            result = deployment_run_task(
+                                task_description,
+                                device,
+                                callback=execution_callback
+                            )
 
-                                # Task completed result put into queue
-                                update_queue.put(
-                                    {
-                                        "status": result.get("status", "unknown"),
-                                        "message": result.get("message", ""),
-                                        "completed": result.get("completed", False),
-                                    }
-                                )
-                                return result
-
-                            # Temporarily replace function
-                            import deployment
-
-                            deployment.run_task = patched_run_task
-
-                            # Execute task
-                            add_log("Starting task execution process...")
-                            result = deployment_run_task(task_description, device)
-
-                            # Restore original function
-                            deployment.run_task = original_run_task
+                            # Put final result in queue
+                            result_queue.put(result)
 
                         except Exception as e:
                             import traceback
-
                             error_message = f"Error during execution: {str(e)}\n{traceback.format_exc()}"
-                            add_log(error_message)
-                            update_queue.put(
-                                {
-                                    "status": "error",
-                                    "message": str(e),
-                                    "completed": False,
-                                }
-                            )
+                            logs.append(f"❌ {error_message}")
+                            result_queue.put({
+                                "status": "error",
+                                "message": str(e),
+                            })
 
                     # Start background thread
                     thread = threading.Thread(target=run_in_background)
                     thread.start()
 
-                    # Continuously update UI until task completes
+                    # Continuously yield updates until task completes
                     import time
+                    step_count = 0
 
                     while thread.is_alive():
-                        time.sleep(0.5)
-                        progress((0.1 + len(logs) * 0.01) % 0.9, "Executing task...")
-                        yield "\n".join(logs), "Executing...", screenshots
+                        try:
+                            # Check for updates (non-blocking)
+                            while not update_queue.empty():
+                                update_type, log_text, screenshot_list = update_queue.get_nowait()
+                                step_count += 1
+                                progress_val = min(0.1 + step_count * 0.05, 0.9)
+                                progress(progress_val, "Executing task...")
+                                yield log_text, "Executing...", screenshot_list
+                        except:
+                            pass
+
+                        time.sleep(0.3)
+                        # Yield current state even if no updates
+                        yield "\n".join(logs), "Executing...", list(screenshots)
+
+                    # Process any remaining updates
+                    while not update_queue.empty():
+                        try:
+                            update_type, log_text, screenshot_list = update_queue.get_nowait()
+                            yield log_text, "Executing...", screenshot_list
+                        except:
+                            break
 
                     # Get final result
                     try:
-                        result = update_queue.get(timeout=5)
+                        result = result_queue.get(timeout=5)
                         status = result.get("status", "unknown")
                         message = result.get("message", "")
-                        completed = result.get("completed", False)
 
-                        if status == "success":
-                            if completed:
-                                final_status = "✅ Execution successful: Task completed"
-                                add_log("✅ Task execution completed!")
-                            else:
-                                final_status = (
-                                    "⚠️ Execution successful but task not completed"
-                                )
-                                add_log(
-                                    "⚠️ Execution process successful but task not completed"
-                                )
-                        else:
+                        if status == "success" or status == "completed":
+                            final_status = "✅ Execution successful: Task completed"
+                            add_log("")
+                            add_log("=" * 50)
+                            add_log("✅ Task execution completed!")
+                        elif status == "error":
                             final_status = f"❌ Execution failed: {message}"
+                            add_log("")
                             add_log(f"❌ Task execution failed: {message}")
+                        else:
+                            final_status = f"⚠️ Execution status: {status}"
+                            add_log(f"⚠️ Final status: {status}")
                     except:
                         final_status = "❓ Unable to retrieve execution result"
                         add_log("❓ Unable to retrieve final execution result")
@@ -1436,16 +1666,13 @@ with gr.Blocks(
                     progress(1.0, "Execution completed")
                     add_log("Task execution process completed")
 
-                    return "\n".join(logs), final_status, screenshots
+                    yield "\n".join(logs), final_status, list(screenshots)
 
                 except Exception as e:
                     import traceback
-
-                    error_message = (
-                        f"Error during execution: {str(e)}\n{traceback.format_exc()}"
-                    )
+                    error_message = f"Error during execution: {str(e)}\n{traceback.format_exc()}"
                     add_log(error_message)
-                    return "\n".join(logs), f"Execution error: {str(e)}", screenshots
+                    yield "\n".join(logs), f"Execution error: {str(e)}", list(screenshots)
 
             # Handle task execution button click
             execute_btn.click(

@@ -4,7 +4,7 @@ from typing import Any, Optional, Tuple
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.output_parsers import JsonOutputParser, StrOutputParser
-from langchain_openai import ChatOpenAI
+from langchain_anthropic import ChatAnthropic
 from langgraph.graph import StateGraph, END
 from langgraph.prebuilt import create_react_agent
 from pydantic import SecretStr
@@ -21,11 +21,38 @@ os.environ["LANGCHAIN_ENDPOINT"] = config.LANGCHAIN_ENDPOINT
 os.environ["LANGCHAIN_API_KEY"] = config.LANGCHAIN_API_KEY
 os.environ["LANGCHAIN_PROJECT"] = "DeploymentExecution"
 
-model = ChatOpenAI(
-    openai_api_base=config.LLM_BASE_URL,
-    openai_api_key=SecretStr(config.LLM_API_KEY),
+
+def extract_text_content(content):
+    """
+    Extract text from Claude's message content.
+    Claude can return content as either:
+    - A string (simple text response)
+    - A list of content blocks like [{"type": "text", "text": "..."}]
+
+    Args:
+        content: Message content (string or list)
+
+    Returns:
+        Extracted text as a string
+    """
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        text_parts = []
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                text_parts.append(block.get("text", ""))
+            elif isinstance(block, str):
+                text_parts.append(block)
+        return " ".join(text_parts).strip()
+    return str(content).strip()
+
+model = ChatAnthropic(
+    api_key=SecretStr(config.ANTHROPIC_API_KEY),
     model_name=config.LLM_MODEL,
-    request_timeout=config.LLM_REQUEST_TIMEOUT,
+    timeout=config.LLM_REQUEST_TIMEOUT,
     max_retries=config.LLM_MAX_RETRIES,
     max_tokens=config.LLM_MAX_TOKEN,
 )
@@ -624,6 +651,7 @@ def fallback_to_react(state: DeploymentState) -> DeploymentState:
     """
     print("🔄 Falling back to React mode execution...")
     task = state["task"]
+    callback = state.get("callback")
 
     # Create action_agent for page operation decisions
     action_agent = create_react_agent(model, [screen_action])
@@ -653,16 +681,40 @@ Each step of the operation should move toward completing the user's goal task.""
         print("Unable to capture or parse screen")
         return state
 
+    # Notify callback about screen capture in React mode
+    if callback:
+        callback(state, "react_capture", {
+            "step": state.get("current_step", 0),
+            "message": f"📸 React mode: Captured screen",
+            "screenshot_path": state["current_page"]["screenshot"],
+            "elements_count": len(state["current_page"].get("elements_data", [])),
+        })
+
     # Prepare screen information
     screenshot_path = state["current_page"]["screenshot"]
     elements_json_path = state["current_page"]["elements_json"]
     device = state["device"]
     device_size = get_device_size.invoke(device)
 
+    # Helper function to detect image media type
+    def get_image_media_type(file_path):
+        ext = os.path.splitext(file_path)[1].lower()
+        if ext == '.png':
+            return 'image/png'
+        elif ext in ['.jpg', '.jpeg']:
+            return 'image/jpeg'
+        elif ext == '.gif':
+            return 'image/gif'
+        elif ext == '.webp':
+            return 'image/webp'
+        else:
+            return 'image/png'  # Default to PNG
+
     # Load screenshot as base64
     with open(screenshot_path, "rb") as f:
         image_data = f.read()
         image_data_base64 = base64.b64encode(image_data).decode("utf-8")
+    image_media_type = get_image_media_type(screenshot_path)
 
     # Load element JSON data
     with open(elements_json_path, "r", encoding="utf-8") as f:
@@ -688,7 +740,7 @@ and complete it by calling tools. All tool calls must pass in device to specify 
                 {"type": "text", "text": "Below is the screenshot data:"},
                 {
                     "type": "image_url",
-                    "image_url": {"url": f"data:image/jpeg;base64,{image_data_base64}"},
+                    "image_url": {"url": f"data:{image_media_type};base64,{image_data_base64}"},
                 },
             ],
         ),
@@ -708,7 +760,15 @@ and complete it by calling tools. All tool calls must pass in device to specify 
         state["messages"].append(ai_message)
 
         # Extract recommended action from final_message
-        recommended_action = ai_message.content.strip()
+        recommended_action = extract_text_content(ai_message.content)
+
+        # Extract LLM reasoning (first AI message has reasoning)
+        llm_reasoning = ""
+        ai_messages = [msg for msg in final_messages if msg.type == "ai"]
+        if ai_messages:
+            first_ai_msg = ai_messages[0]
+            if hasattr(first_ai_msg, 'content') and first_ai_msg.content:
+                llm_reasoning = extract_text_content(first_ai_msg.content)
 
         # Update execution status
         state["current_step"] += 1
@@ -725,6 +785,17 @@ and complete it by calling tools. All tool calls must pass in device to specify 
 
         state["execution_status"] = "success"
         print(f"✓ React mode execution successful: {recommended_action}")
+
+        # Notify callback about React mode action
+        if callback:
+            callback(state, "react_action", {
+                "step": state["current_step"],
+                "message": f"🤖 React mode action executed",
+                "action_details": recommended_action[:200] if len(recommended_action) > 200 else recommended_action,
+                "llm_reasoning": llm_reasoning,
+                "screenshot_path": screenshot_path,
+                "status": "success",
+            })
     else:
         error_msg = "React mode execution failed: No messages returned"
         print(f"❌ {error_msg}")
@@ -742,6 +813,14 @@ and complete it by calling tools. All tool calls must pass in device to specify 
         )
 
         state["execution_status"] = "error"
+
+        # Notify callback about error
+        if callback:
+            callback(state, "react_action", {
+                "step": state["current_step"],
+                "message": f"❌ React mode failed: {error_msg}",
+                "status": "error",
+            })
 
     return state
 
@@ -931,13 +1010,16 @@ def execute_task(
     return {"status": state["execution_status"], "state": state}
 
 
-def run_task(task: str, device: str = "emulator-5554") -> Dict[str, Any]:
+def run_task(task: str, device: str = "emulator-5554", callback=None) -> Dict[str, Any]:
     """
     Execute a single task
 
     Args:
         task: User task description
         device: Device ID
+        callback: Optional callback function for progress updates.
+                  Called with (state, node_name, info) where info contains
+                  step details, screenshots, and action information.
 
     Returns:
         Execution result
@@ -958,6 +1040,9 @@ def run_task(task: str, device: str = "emulator-5554") -> Dict[str, Any]:
             max_retries=3,
             controller=controller,
         )
+
+        # Store callback in state for use by workflow nodes
+        state["callback"] = callback
 
         # Execute task using LangGraph workflow
         workflow = build_workflow()
@@ -1623,6 +1708,16 @@ def capture_screen_node(state: DeploymentState) -> DeploymentState:
     else:
         print("✓ Screen captured successfully")
 
+        # Call callback with screenshot info
+        callback = state.get("callback")
+        if callback:
+            callback(state, "capture_screen", {
+                "step": state.get("current_step", 0),
+                "message": f"📸 Step {state.get('current_step', 0)}: Captured screen",
+                "screenshot_path": state["current_page"]["screenshot"],
+                "elements_count": len(state["current_page"].get("elements_data", [])),
+            })
+
     return state
 
 
@@ -1821,9 +1916,19 @@ def execute_action_node(state: DeploymentState) -> DeploymentState:
     Execute operation
     """
     state_dict = dict(state)
+    callback = state.get("callback")
 
     if state["should_execute_shortcut"] and state["execution_template"]:
         print("🚀 Executing high-level operation...")
+
+        # Notify callback about high-level action execution
+        if callback:
+            callback(state, "execute_action", {
+                "step": state.get("current_step", 0),
+                "message": "🚀 Executing high-level operation...",
+                "action_type": "high_level",
+            })
+
         # Call execute_high_level_action function
         result = execute_high_level_action(
             state_dict, state["associated_shortcuts"], state["execution_template"]
@@ -1841,12 +1946,30 @@ def execute_action_node(state: DeploymentState) -> DeploymentState:
             # Update final screenshot
             if "final_screenshot" in result and "current_page" in state:
                 state["current_page"]["screenshot"] = result["final_screenshot"]
+
+            # Notify callback about success
+            if callback:
+                callback(state, "execute_action", {
+                    "step": state.get("current_step", 0),
+                    "message": "✨ High-level operation executed successfully!",
+                    "action_type": "high_level",
+                    "status": "success",
+                    "screenshot_path": result.get("final_screenshot"),
+                })
         else:
             print(
                 f"❌ High-level operation execution failed: {result.get('message', '')}"
             )
             # Mark for fallback on failure
             state["should_fallback"] = True
+
+            if callback:
+                callback(state, "execute_action", {
+                    "step": state.get("current_step", 0),
+                    "message": f"❌ High-level operation failed: {result.get('message', '')}",
+                    "action_type": "high_level",
+                    "status": "error",
+                })
     else:
         print("📝 Attempting to match task with high-level actions...")
         # Call match_task_to_action function
@@ -1898,11 +2021,31 @@ def fallback_node(state: DeploymentState) -> DeploymentState:
     """
     print("⚠️ Falling back to basic operation space")
 
+    callback = state.get("callback")
+
+    # Notify callback about fallback
+    if callback:
+        callback(state, "fallback", {
+            "step": state.get("current_step", 0),
+            "message": "⚠️ Falling back to React mode (basic operations)",
+            "action_type": "fallback",
+        })
+
     # Call fallback_to_react function
     state = fallback_to_react(state)
 
     # Mark task as completed
     state["completed"] = True
+
+    # Notify callback about fallback completion
+    if callback:
+        callback(state, "fallback", {
+            "step": state.get("current_step", 0),
+            "message": f"React mode execution status: {state.get('execution_status', 'unknown')}",
+            "action_type": "fallback",
+            "status": state.get("execution_status", "unknown"),
+            "screenshot_path": state.get("current_page", {}).get("screenshot"),
+        })
 
     return state
 
@@ -2050,19 +2193,30 @@ def check_task_completion(state: DeploymentState) -> DeploymentState:
         print("⚠️ No screenshots available, cannot determine if task is complete")
         return state
 
+    # Helper function to detect image media type
+    def get_img_media_type(file_path):
+        ext = os.path.splitext(file_path)[1].lower()
+        if ext == '.png':
+            return 'image/png'
+        elif ext in ['.jpg', '.jpeg']:
+            return 'image/jpeg'
+        else:
+            return 'image/png'  # Default to PNG
+
     # Build image messages
     image_messages = []
     for idx, img_path in enumerate(recent_screenshots, start=1):
         if os.path.exists(img_path):
             with open(img_path, "rb") as f:
                 img_data = base64.b64encode(f.read()).decode("utf-8")
+            img_media_type = get_img_media_type(img_path)
             image_messages.append(
                 HumanMessage(
                     content=[
                         {"type": "text", "text": f"Here is data for screenshot {idx}:"},
                         {
                             "type": "image_url",
-                            "image_url": {"url": f"data:image/jpeg;base64,{img_data}"},
+                            "image_url": {"url": f"data:{img_media_type};base64,{img_data}"},
                         },
                     ]
                 )
@@ -2088,7 +2242,7 @@ def check_task_completion(state: DeploymentState) -> DeploymentState:
 
     # Call LLM for judgment
     judgement_response = model.invoke(all_messages)
-    judgement_answer = judgement_response.content.strip()
+    judgement_answer = extract_text_content(judgement_response.content)
 
     # Update task completion status
     if "yes" in judgement_answer.lower() or "complete" in judgement_answer.lower():

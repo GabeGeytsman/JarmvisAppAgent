@@ -85,15 +85,17 @@ def take_screenshot(
     save_dir: str = "./log/screenshots",
     app_name: str = None,
     step: int = 0,
+    task_id: str = None,
 ) -> str:
     """
-    Take a screenshot of the device and save it to a directory organized by application.
+    Take a screenshot of the device and save it to a directory organized by task.
 
     Parameters:
         - device (str): Device ID (used only in fallback mode)
-        - save_dir (str): Directory path to save the screenshot
+        - save_dir (str): Directory path to save the screenshot (fallback if no task_id)
         - app_name (str): Name of the current application
         - step (int): Step number of the current operation
+        - task_id (str): Unique task identifier for folder organization
 
     Returns:
         - Success: Path string where the screenshot is saved.
@@ -102,9 +104,14 @@ def take_screenshot(
     if app_name is None:
         app_name = "unknown_app"
 
-    # Create subdirectory organized by application
-    app_dir = os.path.join(save_dir, app_name)
-    os.makedirs(app_dir, exist_ok=True)
+    # Use task_id-based folder structure if available
+    if task_id:
+        screenshot_dir = f"./log/tasks/{task_id}/screenshots"
+    else:
+        # Fallback to old app-based structure
+        screenshot_dir = os.path.join(save_dir, app_name)
+
+    os.makedirs(screenshot_dir, exist_ok=True)
 
     # Generate filename
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -113,7 +120,7 @@ def take_screenshot(
     else:
         filename = f"{app_name}_{timestamp}.png"
 
-    screenshot_file = Path(app_dir) / filename
+    screenshot_file = Path(screenshot_dir) / filename
 
     if has_controller():
         try:

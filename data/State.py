@@ -13,10 +13,15 @@ class State(TypedDict):
     State machine for learning mode
     """
 
+    # Task identification and logging
+    task_id: str  # Unique task identifier (timestamp-based)
+    save_screenshots: bool  # Whether to retain screenshots after task completion
+
     # Task related
     tsk: str  # Current task name (e.g., open an app, find specific content)
     app_name: str  # Current application name
     completed: bool  # Whether the task is completed
+    agent_signals_complete: bool  # Whether the action agent believes task is complete
     step: int  # Counter for current execution step
     history_steps: List[
         Dict

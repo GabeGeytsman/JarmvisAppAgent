@@ -8,6 +8,7 @@ try:
     from app_secrets import (
         LLM_BASE_URL,
         LLM_API_KEY,
+        ANTHROPIC_API_KEY,
         PINECONE_API_KEY,
         NEO4J_URI,
         NEO4J_USERNAME,
@@ -22,10 +23,11 @@ except ImportError:
 # -----------------------------------------------------------------------------
 # LLM Configuration
 # -----------------------------------------------------------------------------
-LLM_MODEL = "gpt-4o"  # OpenAI GPT-4o (vision-capable)
-LLM_MAX_TOKEN = 1500
+LLM_MODEL = "claude-sonnet-4-5-20250929"  # Anthropic Claude Sonnet 4.5 (top-rated for computer use)
+LLM_MAX_TOKEN = 4096
 LLM_REQUEST_TIMEOUT = 500
 LLM_MAX_RETRIES = 3
+LLM_PROVIDER = "anthropic"  # "anthropic" or "openai"
 
 # -----------------------------------------------------------------------------
 # LangChain/LangSmith Configuration
