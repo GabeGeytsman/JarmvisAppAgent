@@ -200,28 +200,83 @@ def auto_exploration():
             # Display step and action details prominently
             step_num = info.get("step", state.get("step", "?"))
 
-            if node_name == "page_understand":
-                auto_log_storage.append(f"[{timestamp}] 📷 STEP {step_num}: Screen Analysis")
+            if node_name == "page_understand_start":
+                # Intermediate: Starting screenshot capture
+                auto_log_storage.append(f"[{timestamp}] 📸 STEP {step_num}: Starting Screenshot")
+                auto_log_storage.append("-" * 30)
+                if info.get("message"):
+                    auto_log_storage.append(info["message"])
+
+            elif node_name == "screenshot_captured":
+                # Intermediate: Screenshot captured, sending to OmniParser
+                auto_log_storage.append(f"[{timestamp}] 🔄 STEP {step_num}: Analyzing Screen")
+                auto_log_storage.append("-" * 30)
+                if info.get("message"):
+                    auto_log_storage.append(info["message"])
+                # Show screenshot immediately
+                screenshot_path = info.get("screenshot_path")
+                if screenshot_path and screenshot_path not in auto_page_storage:
+                    auto_page_storage.append(screenshot_path)
+                    logger.info(f"  CALLBACK: Added raw screenshot: {screenshot_path}")
+
+            elif node_name == "page_understand":
+                auto_log_storage.append(f"[{timestamp}] ✅ STEP {step_num}: Screen Analysis Complete")
+                auto_log_storage.append("-" * 30)
+                if info.get("message"):
+                    auto_log_storage.append(info["message"])
+                # Show timing breakdown if available
+                if info.get("screenshot_time") and info.get("omniparser_time"):
+                    auto_log_storage.append(f"   ⏱️ Screenshot: {info['screenshot_time']:.1f}s | OmniParser: {info['omniparser_time']:.1f}s")
+
+            elif node_name == "gridded_screenshot":
+                # Show the gridded image that will be sent to Claude
+                auto_log_storage.append(f"[{timestamp}] 🔲 STEP {step_num}: Grid Overlay Created")
+                auto_log_storage.append("-" * 30)
+                if info.get("message"):
+                    auto_log_storage.append(info["message"])
+                # Add gridded image to gallery so user can see what Claude sees
+                gridded_image = info.get("labeled_image_path")
+                if gridded_image and gridded_image not in auto_page_storage:
+                    auto_page_storage.append(gridded_image)
+                    logger.info(f"  CALLBACK: Added gridded screenshot BEFORE LLM call: {gridded_image}")
+
+            elif node_name == "action_agent_thinking":
+                # Intermediate: LLM is analyzing and deciding
+                auto_log_storage.append(f"[{timestamp}] 🤔 STEP {step_num}: Claude Thinking")
                 auto_log_storage.append("-" * 30)
                 if info.get("message"):
                     auto_log_storage.append(info["message"])
 
             elif node_name == "perform_action":
                 action_details = info.get("action_details", "Unknown action")
-                auto_log_storage.append(f"[{timestamp}] 🤖 STEP {step_num}: Executing Action")
+                llm_time = info.get("llm_time", 0)
+                auto_log_storage.append(f"[{timestamp}] 🤖 STEP {step_num}: Action Executed")
                 auto_log_storage.append("-" * 30)
-                auto_log_storage.append(f"ACTION: {action_details}")
-                auto_log_storage.append("")
 
-                # Display LLM reasoning prominently
+                # Show LLM reasoning FIRST (before action)
                 llm_reasoning = info.get("llm_reasoning", "")
                 if llm_reasoning:
-                    auto_log_storage.append("💭 LLM REASONING:")
+                    auto_log_storage.append("💭 PRE-ACTION REASONING:")
                     # Wrap long reasoning text
                     for line in llm_reasoning.split('\n'):
                         if line.strip():
                             auto_log_storage.append(f"   {line.strip()}")
                     auto_log_storage.append("")
+
+                # Then show the action taken
+                auto_log_storage.append(f"▶️ ACTION: {action_details}")
+                if llm_time:
+                    auto_log_storage.append(f"   ⏱️ Claude response time: {llm_time:.1f}s")
+
+                # Show actual ADB command executed (critical for debugging)
+                adb_command = info.get("adb_command", "")
+                adb_status = info.get("adb_status", "")
+                if adb_command:
+                    auto_log_storage.append(f"🔧 [ADB EXECUTED]: {adb_command}")
+                    auto_log_storage.append(f"   Status: {adb_status.upper()}")
+                else:
+                    auto_log_storage.append(f"⚠️ [ADB]: No command captured - tool may not have been called!")
+                auto_log_storage.append("")
 
             elif node_name == "tsk_setting":
                 auto_log_storage.append(f"[{timestamp}] ⚙️ Task Setup")
@@ -386,6 +441,27 @@ def auto_exploration():
                             auto_page_storage.extend(updated_pages)
                             logger.info(f"Updated {len(updated_pages)} image paths after folder rename")
 
+                            # Also update paths in final_state.history_steps
+                            if final_state.get("history_steps"):
+                                for step in final_state["history_steps"]:
+                                    if step.get("source_page") and old_rel in step["source_page"]:
+                                        step["source_page"] = step["source_page"].replace(old_rel, new_rel)
+                                    if step.get("source_json") and old_rel in step["source_json"]:
+                                        step["source_json"] = step["source_json"].replace(old_rel, new_rel)
+                                logger.info(f"Updated paths in final_state.history_steps")
+
+                            # Update current_page_screenshot path
+                            if final_state.get("current_page_screenshot") and old_rel in final_state["current_page_screenshot"]:
+                                final_state["current_page_screenshot"] = final_state["current_page_screenshot"].replace(old_rel, new_rel)
+
+                            # Update current_page_json path if it's a string
+                            if isinstance(final_state.get("current_page_json"), str) and old_rel in final_state["current_page_json"]:
+                                final_state["current_page_json"] = final_state["current_page_json"].replace(old_rel, new_rel)
+                            elif isinstance(final_state.get("current_page_json"), dict):
+                                for key in final_state["current_page_json"]:
+                                    if isinstance(final_state["current_page_json"][key], str) and old_rel in final_state["current_page_json"][key]:
+                                        final_state["current_page_json"][key] = final_state["current_page_json"][key].replace(old_rel, new_rel)
+
                 # Handle screenshot cleanup if disabled
                 save_screenshots = final_state.get("save_screenshots", True)
                 if not save_screenshots:
@@ -511,7 +587,61 @@ def get_json_files(directory: str = "./log/json_state") -> list:
 
 
 with gr.Blocks(
-    css="#json_files_table table { border-collapse: collapse; width: 100%; } #json_files_table thead { background-color: #f3f4f6; } #json_files_table th { padding: 10px; text-align: left; border-bottom: 2px solid #e5e7eb; } #json_files_table td { padding: 8px 10px; border-bottom: 1px solid #e5e7eb; } #json_files_table tr:hover { background-color: #f9fafb; } #json_files_table .scroll-hide { overflow-x: hidden !important; } #json_files_table { user-select: none; }"
+    css="""
+    #json_files_table table { border-collapse: collapse; width: 100%; }
+    #json_files_table thead { background-color: #f3f4f6; }
+    #json_files_table th { padding: 10px; text-align: left; border-bottom: 2px solid #e5e7eb; }
+    #json_files_table td { padding: 8px 10px; border-bottom: 1px solid #e5e7eb; }
+    #json_files_table tr:hover { background-color: #f9fafb; }
+    #json_files_table .scroll-hide { overflow-x: hidden !important; }
+    #json_files_table { user-select: none; }
+    #auto_exploration_log textarea { font-family: monospace; font-size: 12px; }
+    """,
+    js="""
+    function setupAutoScroll() {
+        // Auto-scroll log panels to bottom when content changes
+        const observer = new MutationObserver(function(mutations) {
+            mutations.forEach(function(mutation) {
+                if (mutation.type === 'childList' || mutation.type === 'characterData') {
+                    const target = mutation.target;
+                    // Find the textarea inside the log panel
+                    let textarea = target;
+                    if (!textarea.tagName || textarea.tagName.toLowerCase() !== 'textarea') {
+                        textarea = target.querySelector('textarea');
+                    }
+                    if (textarea && textarea.tagName && textarea.tagName.toLowerCase() === 'textarea') {
+                        textarea.scrollTop = textarea.scrollHeight;
+                    }
+                }
+            });
+        });
+
+        // Observe the exploration log container
+        function observeLogPanels() {
+            const logPanels = document.querySelectorAll('#auto_exploration_log, .prose');
+            logPanels.forEach(function(panel) {
+                observer.observe(panel, { childList: true, subtree: true, characterData: true });
+            });
+
+            // Also observe textareas directly
+            const textareas = document.querySelectorAll('textarea');
+            textareas.forEach(function(textarea) {
+                const parentObserver = new MutationObserver(function() {
+                    textarea.scrollTop = textarea.scrollHeight;
+                });
+                if (textarea.parentElement) {
+                    parentObserver.observe(textarea.parentElement, { childList: true, subtree: true });
+                }
+            });
+        }
+
+        // Initial setup and re-setup on DOM changes
+        observeLogPanels();
+        setInterval(observeLogPanels, 2000);
+
+        return [];
+    }
+    """
 ) as demo:
     with gr.Tabs():
         # Tab 1: Initialization
@@ -555,7 +685,8 @@ with gr.Blocks(
             with gr.Row():
                 with gr.Column():
                     exploration_output = gr.TextArea(
-                        label="Exploration Log", interactive=False
+                        label="Exploration Log", interactive=False,
+                        elem_id="auto_exploration_log", lines=20
                     )
                     explore_button = gr.Button("Start Exploration")
                     clear_images_button = gr.Button(

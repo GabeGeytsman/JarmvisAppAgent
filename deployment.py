@@ -187,29 +187,60 @@ def capture_and_parse_screen(state: DeploymentState) -> DeploymentState:
     Returns:
         Updated deployment state
     """
+    import time
+
     try:
-        # 1. Take screenshot
+        step_num = state.get("current_step", 0)
+        callback = state.get("callback")
+
+        # Log: Starting screenshot capture
+        if callback:
+            callback(state, "screenshot_start", {
+                "step": step_num,
+                "message": f"📸 Step {step_num}: Taking screenshot via ADB...",
+            })
+
+        # 1. Take screenshot with task_id and app_name for proper folder structure
+        screenshot_start = time.time()
         screenshot_path = take_screenshot.invoke(
             {
                 "device": state["device"],
-                "app_name": "deployment",
+                "app_name": state.get("app_name", "deployment"),
                 "step": state["current_step"],
+                "task_id": state.get("task_id"),
             }
         )
+        screenshot_elapsed = time.time() - screenshot_start
 
         if not screenshot_path or not os.path.exists(screenshot_path):
             print("❌ Screenshot failed")
             return state
 
+        # IMPORTANT: Set screenshot path immediately after capture
+        # This ensures fallback_to_react won't try to recapture if OmniParser fails
+        state["current_page"]["screenshot"] = screenshot_path
+
+        # Log: Screenshot captured, starting OmniParser
+        if callback:
+            callback(state, "screenshot_captured", {
+                "step": step_num,
+                "message": f"📸 Step {step_num}: Screenshot captured in {screenshot_elapsed:.1f}s. Sending to OmniParser...",
+                "screenshot_path": screenshot_path,
+            })
+
         # 2. Parse screen elements
+        omni_start = time.time()
         screen_result = screen_element.invoke({"image_path": screenshot_path})
+        omni_elapsed = time.time() - omni_start
 
         if "error" in screen_result:
             print(f"❌ Screen element parsing failed: {screen_result['error']}")
+            # Set empty elements data so fallback_to_react can at least try with just screenshot
+            state["current_page"]["elements_json"] = None
+            state["current_page"]["elements_data"] = []
             return state
 
-        # 3. Update current page information
-        state["current_page"]["screenshot"] = screenshot_path
+        # 3. Update current page information (screenshot already set above)
         state["current_page"]["elements_json"] = screen_result[
             "parsed_content_json_path"
         ]
@@ -220,9 +251,23 @@ def capture_and_parse_screen(state: DeploymentState) -> DeploymentState:
         ) as f:
             state["current_page"]["elements_data"] = json.load(f)
 
+        elements_count = len(state["current_page"]["elements_data"])
         print(
-            f"✓ Successfully parsed current screen, detected {len(state['current_page']['elements_data'])} UI elements"
+            f"✓ Step {step_num}: Screen captured ({screenshot_elapsed:.1f}s) and parsed ({omni_elapsed:.1f}s), detected {elements_count} UI elements"
         )
+
+        # Log: Screen analysis complete
+        if callback:
+            callback(state, "screen_parsed", {
+                "step": step_num,
+                "message": f"📷 Step {step_num}: Screen analysis complete (Screenshot: {screenshot_elapsed:.1f}s, OmniParser: {omni_elapsed:.1f}s)",
+                "screenshot_path": screenshot_path,
+                "labeled_image_path": screen_result.get("labeled_image_path"),
+                "elements_count": elements_count,
+                "screenshot_time": screenshot_elapsed,
+                "omniparser_time": omni_elapsed,
+            })
+
         return state
 
     except Exception as e:
@@ -641,29 +686,56 @@ def execute_element_action(
 
 def fallback_to_react(state: DeploymentState) -> DeploymentState:
     """
-    Fall back to React mode when template execution fails
+    Fall back to React mode when template execution fails.
+    Executes ONE step at a time, relying on the workflow loop for iteration.
 
     Args:
         state: Execution state
 
     Returns:
-        Updated execution state
+        Updated execution state with agent_signals_complete flag if task is done
     """
-    print("🔄 Falling back to React mode execution...")
+    print("🔄 Executing React mode step...")
     task = state["task"]
     callback = state.get("callback")
 
     # Create action_agent for page operation decisions
-    action_agent = create_react_agent(model, [screen_action])
+    # Explicitly bind tools to the model to ensure they are passed to the Claude API
+    tools = [screen_action, request_completion_check]
+    model_with_tools = model.bind_tools(tools)
+    action_agent = create_react_agent(model_with_tools, tools)
 
     # Initialize React mode
     if not state["messages"]:
-        # Set system prompt
+        # Set system prompt with tool-based completion signal
         system_message = SystemMessage(
             content="""You are an intelligent smartphone operation assistant who will help users complete tasks on mobile devices.
 You can help users by observing the screen and performing various operations (clicking, typing text, swiping, etc.).
 Analyze the current screen content, determine the best next action, and use the appropriate tools to execute it.
-Each step of the operation should move toward completing the user's goal task."""
+Each step of the operation should move toward completing the user's goal task.
+
+AVAILABLE TOOLS:
+1. screen_action - Interact with the device using these actions:
+   - "tap": Tap at specific coordinates (requires x, y)
+   - "text": Type text (requires input_str) - NOTE: You must tap a text field first to focus it!
+   - "enter": Press Enter/Search key - USE THIS AFTER TYPING to submit a search query or form
+   - "back": Press the back button
+   - "swipe": Swipe in a direction (requires x, y, direction: "up", "down", "left", or "right")
+   - "long_press": Long press at coordinates (requires x, y)
+
+2. request_completion_check - Call this when you believe the task is FULLY complete and you can SEE the result on screen.
+
+IMPORTANT RULES:
+1. THINK STEP-BY-STEP: Before acting, explain what you see on screen and why you're taking this action.
+2. ONE ACTION AT A TIME: Only perform ONE action per turn.
+3. TAP BEFORE TYPING: You MUST tap on a text input field to focus it BEFORE you can type text into it.
+4. PRESS ENTER AFTER TYPING: After typing a search query or form input, use action="enter" to submit it.
+5. BE PRECISE: Use the element IDs and bounding boxes to calculate exact tap coordinates.
+   - The bbox values are relative (0-1 range). Multiply by screen width/height to get absolute coordinates.
+
+TASK COMPLETION:
+- When the task is complete and you can SEE the final result on screen, call request_completion_check(reason="description of what you see").
+- Do NOT call request_completion_check immediately after an action - wait for the next screenshot first."""
         )
 
         state["messages"].append(system_message)
@@ -674,25 +746,33 @@ Each step of the operation should move toward completing the user's goal task.""
         )
         state["messages"].append(user_message)
 
-    # Capture current screen
-    state = capture_and_parse_screen(state)
-    if not state["current_page"]["screenshot"]:
-        state["execution_status"] = "error"
-        print("Unable to capture or parse screen")
-        return state
+    # Capture current screen (only if not already captured by capture_screen_node)
+    if not state["current_page"].get("screenshot"):
+        state = capture_and_parse_screen(state)
+        if not state["current_page"]["screenshot"]:
+            state["execution_status"] = "error"
+            print("Unable to capture or parse screen")
+            return state
 
-    # Notify callback about screen capture in React mode
-    if callback:
-        callback(state, "react_capture", {
-            "step": state.get("current_step", 0),
-            "message": f"📸 React mode: Captured screen",
-            "screenshot_path": state["current_page"]["screenshot"],
-            "elements_count": len(state["current_page"].get("elements_data", [])),
-        })
+        # Notify callback about screen capture in React mode
+        if callback:
+            callback(state, "react_capture", {
+                "step": state.get("current_step", 0),
+                "message": f"📸 React mode: Captured screen",
+                "screenshot_path": state["current_page"]["screenshot"],
+                "elements_count": len(state["current_page"].get("elements_data", [])),
+            })
 
     # Prepare screen information
-    screenshot_path = state["current_page"]["screenshot"]
-    elements_json_path = state["current_page"]["elements_json"]
+    screenshot_path = state["current_page"].get("screenshot")
+    elements_json_path = state["current_page"].get("elements_json")
+
+    # Validate we have at least the screenshot (elements are optional - agent can work from image alone)
+    if not screenshot_path:
+        state["execution_status"] = "error"
+        print("❌ Missing screenshot path")
+        return state
+
     device = state["device"]
     device_size = get_device_size.invoke(device)
 
@@ -716,20 +796,74 @@ Each step of the operation should move toward completing the user's goal task.""
         image_data_base64 = base64.b64encode(image_data).decode("utf-8")
     image_media_type = get_image_media_type(screenshot_path)
 
-    # Load element JSON data
-    with open(elements_json_path, "r", encoding="utf-8") as f:
-        elements_data = json.load(f)
+    # Load element JSON data (use empty list if not available - agent can still work from screenshot)
+    elements_data = []
+    if elements_json_path and os.path.exists(elements_json_path):
+        try:
+            with open(elements_json_path, "r", encoding="utf-8") as f:
+                elements_data = json.load(f)
+        except Exception as e:
+            print(f"⚠️ Could not load elements JSON: {e}, continuing with screenshot only")
+    else:
+        print("⚠️ No elements JSON available, agent will work from screenshot only")
 
     elements_text = json.dumps(elements_data, ensure_ascii=False, indent=2)
 
-    # Build messages
+    # Build action history summary so agent knows what it already did
+    action_history_summary = ""
+    if state.get("history"):
+        recent_actions = state["history"][-5:]  # Last 5 actions
+        action_lines = []
+        for h in recent_actions:
+            step = h.get("step", "?")
+            action_detail = h.get("action_details", h.get("action", "unknown"))
+            status = h.get("status", "?")
+            action_lines.append(f"  Step {step}: {action_detail} (status: {status})")
+        if action_lines:
+            action_history_summary = "\n\nPREVIOUS ACTIONS YOU ALREADY TOOK:\n" + "\n".join(action_lines) + "\n\nDo NOT repeat these actions. Continue with the NEXT logical step."
+
+    # Build fresh messages each iteration with the FULL system prompt
+    # This ensures the agent always has the complete instructions even after [-4:] slicing
     messages = [
         SystemMessage(
-            content=f"""Below is the current page information and user intent. Please analyze comprehensively and recommend the next reasonable action (please complete only one step),
-and complete it by calling tools. All tool calls must pass in device to specify the operating device. Only execute one tool call."""
+            content=f"""You are an intelligent smartphone operation assistant controlling a mobile device.
+
+CRITICAL RULES - READ CAREFULLY:
+1. You can ONLY execute ONE action per turn. After your action, you will receive a NEW screenshot showing the result.
+2. You CANNOT see the result of your action until the NEXT turn. Do NOT assume your action succeeded.
+3. NEVER claim you completed multiple steps - you can only do ONE thing, then you must WAIT for the next screenshot.
+4. Do NOT hallucinate or make up results. You have NO knowledge of what happened after your action until you see the next screenshot.
+
+AVAILABLE ACTIONS (choose exactly ONE):
+- "tap": Tap at coordinates (x, y) - use this to click buttons, focus text fields, etc.
+- "text": Type text (input_str) - ONLY use AFTER you have tapped a text field in a PREVIOUS step and confirmed it's focused
+- "enter": Press Enter/Search key - ONLY use AFTER you have typed text in a PREVIOUS step
+- "back": Press back button
+- "swipe": Swipe in direction (x, y, direction: "up"/"down"/"left"/"right")
+- "long_press": Long press at (x, y)
+
+WORKFLOW FOR TYPING IN A SEARCH BOX:
+- Step 1: TAP on the search box to focus it → STOP and wait for next screenshot
+- Step 2: (After seeing keyboard appear) TYPE your query → STOP and wait for next screenshot
+- Step 3: (After seeing text entered) Press ENTER to submit → STOP and wait for next screenshot
+- Step 4: (After seeing results) Signal TASK_COMPLETE
+
+COORDINATE CALCULATION:
+- bbox values are relative (0-1 range). Multiply by screen width/height for absolute coordinates.
+- Example: bbox [0.3, 0.4, 0.7, 0.5] on 1080x1920 screen → center is (540, 864)
+
+TASK COMPLETION:
+- ONLY signal "TASK_COMPLETE: YES" when you can SEE the final result on the CURRENT screenshot.
+- If you just performed an action, you CANNOT know if it succeeded yet. Wait for the next screenshot.
+
+Your response format:
+1. Describe what you see on the CURRENT screenshot
+2. State the ONE action you will take and why
+3. Execute that ONE action using the tool
+4. STOP - do not claim success or describe what will happen next"""
         ),
         HumanMessage(
-            content=f"The current device is: {device}, the device screen size is {device_size}. The user's current task intent is: {task}"
+            content=f"The current device is: {device}, the device screen size is {device_size}. The user's current task intent is: {task}{action_history_summary}"
         ),
         HumanMessage(
             content="Below is the current page's parsed JSON data (where bbox is a relative value, please convert to actual operation position based on screen size):\n"
@@ -749,8 +883,18 @@ and complete it by calling tools. All tool calls must pass in device to specify 
     # Add these messages to state
     state["messages"].extend(messages)
 
+    # Log: LLM is analyzing and deciding action
+    if callback:
+        callback(state, "action_agent_thinking", {
+            "step": state.get("current_step", 0),
+            "message": f"🤔 Step {state.get('current_step', 0)}: Claude is analyzing screen and deciding next action...",
+        })
+
     # Call action_agent for decision making and action execution
+    import time
+    llm_start = time.time()
     action_result = action_agent.invoke({"messages": state["messages"][-4:]})
+    llm_elapsed = time.time() - llm_start
 
     # Parse results
     final_messages = action_result.get("messages", [])
@@ -762,13 +906,67 @@ and complete it by calling tools. All tool calls must pass in device to specify 
         # Extract recommended action from final_message
         recommended_action = extract_text_content(ai_message.content)
 
-        # Extract LLM reasoning (first AI message has reasoning)
+        # Extract LLM reasoning (first AI message has reasoning before tool call)
+        # NOTE: We intentionally only show the FIRST AI message (reasoning before action)
+        # The second AI message is often the LLM hallucinating about success before seeing results
         llm_reasoning = ""
         ai_messages = [msg for msg in final_messages if msg.type == "ai"]
         if ai_messages:
             first_ai_msg = ai_messages[0]
             if hasattr(first_ai_msg, 'content') and first_ai_msg.content:
                 llm_reasoning = extract_text_content(first_ai_msg.content)
+
+        # Parse tool messages to check if a tool was actually called
+        # Also detect if request_completion_check was called
+        tool_messages = [msg for msg in final_messages if msg.type == "tool"]
+        tool_output = {}
+        agent_signals_complete = False
+        completion_check_reason = ""
+
+        for tool_message in tool_messages:
+            try:
+                parsed_output = json.loads(tool_message.content)
+                # Check if this is the completion check tool
+                if parsed_output.get("tool") == "request_completion_check" or parsed_output.get("status") == "completion_check_requested":
+                    agent_signals_complete = True
+                    completion_check_reason = parsed_output.get("reason", "")
+                    print(f"🔍 Agent called request_completion_check: {completion_check_reason}")
+                else:
+                    # Regular tool output (screen_action)
+                    tool_output.update(parsed_output)
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+        state["agent_signals_complete"] = agent_signals_complete
+        if completion_check_reason:
+            state["completion_check_reason"] = completion_check_reason
+
+        # Determine action details for logging
+        action_details = ""
+        if tool_output:
+            action_type = tool_output.get("action", "unknown")
+            if action_type == "tap":
+                coords = tool_output.get("clicked_element", {})
+                action_details = f"🖱️ TAP at ({coords.get('x', '?')}, {coords.get('y', '?')})"
+            elif action_type == "text":
+                text = tool_output.get("input_str", "")
+                action_details = f"⌨️ TYPE: \"{text}\""
+            elif action_type == "swipe":
+                direction = tool_output.get("direction", "?")
+                action_details = f"👆 SWIPE {direction}"
+            elif action_type == "long_press":
+                coords = tool_output.get("long_press", {})
+                action_details = f"👆 LONG PRESS at ({coords.get('x', '?')}, {coords.get('y', '?')})"
+            elif action_type == "back":
+                action_details = "⬅️ BACK button pressed"
+            elif action_type == "enter":
+                action_details = "⏎ ENTER key pressed (submit)"
+            else:
+                action_details = f"Action: {action_type}"
+            print(f"✓ Tool executed: {action_details}")
+        else:
+            print("⚠️ No tool was executed in this step")
+            action_details = "No action executed"
 
         # Update execution status
         state["current_step"] += 1
@@ -779,22 +977,27 @@ and complete it by calling tools. All tool calls must pass in device to specify 
                 "elements_json": elements_json_path,
                 "action": "react_mode",
                 "recommended_action": recommended_action,
-                "status": "success",
+                "tool_output": tool_output,
+                "action_details": action_details,
+                "status": "success" if tool_output else "no_action",
             }
         )
 
         state["execution_status"] = "success"
-        print(f"✓ React mode execution successful: {recommended_action}")
+        print(f"✓ React mode step {state['current_step']} complete (LLM: {llm_elapsed:.1f}s)")
 
         # Notify callback about React mode action
         if callback:
             callback(state, "react_action", {
                 "step": state["current_step"],
-                "message": f"🤖 React mode action executed",
-                "action_details": recommended_action[:200] if len(recommended_action) > 200 else recommended_action,
+                "message": f"🤖 Step {state['current_step']}: {action_details} (LLM: {llm_elapsed:.1f}s)",
+                "action_details": action_details,
                 "llm_reasoning": llm_reasoning,
+                "tool_output": tool_output,
                 "screenshot_path": screenshot_path,
                 "status": "success",
+                "agent_signals_complete": agent_signals_complete,
+                "llm_time": llm_elapsed,
             })
     else:
         error_msg = "React mode execution failed: No messages returned"
@@ -813,6 +1016,7 @@ and complete it by calling tools. All tool calls must pass in device to specify 
         )
 
         state["execution_status"] = "error"
+        state["agent_signals_complete"] = False
 
         # Notify callback about error
         if callback:
@@ -1010,7 +1214,7 @@ def execute_task(
     return {"status": state["execution_status"], "state": state}
 
 
-def run_task(task: str, device: str = "emulator-5554", callback=None) -> Dict[str, Any]:
+def run_task(task: str, device: str = "emulator-5554", callback=None, save_screenshots: bool = True) -> Dict[str, Any]:
     """
     Execute a single task
 
@@ -1020,16 +1224,33 @@ def run_task(task: str, device: str = "emulator-5554", callback=None) -> Dict[st
         callback: Optional callback function for progress updates.
                   Called with (state, node_name, info) where info contains
                   step details, screenshots, and action information.
+        save_screenshots: Whether to retain screenshots after task completion
 
     Returns:
         Execution result
     """
+    from datetime import datetime
+
+    # Generate task_id
+    task_id = datetime.now().strftime("%Y%m%d_%H%M%S")
     print(f"🚀 Starting task execution: {task}")
+    print(f"📋 Task ID: {task_id}")
 
     try:
         # Initialize and set the device controller
         controller = ADBController(device_id=device)
         set_controller(controller)
+
+        # Infer app_name from task (like exploration mode)
+        app_name_message = [
+            SystemMessage(content="Please reply with only the application name"),
+            HumanMessage(
+                content=f"The task goal is: {task}, please infer the related application name. (The application name should not contain spaces) and reply with only one"
+            ),
+        ]
+        app_name_response = model.invoke(app_name_message)
+        app_name = extract_text_content(app_name_response.content)
+        print(f"📱 Inferred app: {app_name}")
 
         # Initialize state using create_deployment_state function
         from data.State import create_deployment_state
@@ -1039,6 +1260,9 @@ def run_task(task: str, device: str = "emulator-5554", callback=None) -> Dict[st
             device=device,
             max_retries=3,
             controller=controller,
+            task_id=task_id,
+            app_name=app_name,
+            save_screenshots=save_screenshots,
         )
 
         # Store callback in state for use by workflow nodes
@@ -1062,11 +1286,17 @@ def run_task(task: str, device: str = "emulator-5554", callback=None) -> Dict[st
             except Exception as e:
                 print(f"Unable to display final screenshot: {str(e)}")
 
+        print(f"✅ Task execution complete: {result['execution_status']}")
+        print(f"📊 Steps completed: {result['current_step']}")
+
         return {
             "status": result["execution_status"],
             "message": "Task execution completed",
             "steps_completed": result["current_step"],
             "total_steps": result["total_steps"],
+            "task_id": task_id,
+            "app_name": app_name,
+            "state": result,  # Return full state for debugging/saving
         }
 
     except Exception as e:
@@ -1075,6 +1305,7 @@ def run_task(task: str, device: str = "emulator-5554", callback=None) -> Dict[st
             "status": "error",
             "message": f"Error executing task: {str(e)}",
             "error": str(e),
+            "task_id": task_id,
         }
 
 
@@ -1694,6 +1925,12 @@ def execute_high_level_action(
 def capture_screen_node(state: DeploymentState) -> DeploymentState:
     print("📸 Capturing and parsing current screen...")
 
+    # Clear old screen data to ensure fresh capture
+    # This is important for React mode loop to get updated state after each action
+    state["current_page"]["screenshot"] = None
+    state["current_page"]["elements_json"] = None
+    state["current_page"]["elements_data"] = []
+
     state_dict = dict(state)
     updated_state = capture_and_parse_screen(state_dict)
 
@@ -2017,34 +2254,62 @@ def execute_action_node(state: DeploymentState) -> DeploymentState:
 
 def fallback_node(state: DeploymentState) -> DeploymentState:
     """
-    Fall back to React mode
+    Fall back to React mode - executes ONE step at a time, then returns to workflow loop.
+
+    This matches the exploration phase flow:
+    - Execute ONE action
+    - Return to check_completion which verifies with judge LLM
+    - If not complete, loop back to capture_screen and continue
     """
-    print("⚠️ Falling back to basic operation space")
+    # Mark that we're in React mode to stay in fallback loop
+    state["in_react_mode"] = True
+
+    current_step = state.get("current_step", 0)
+    print(f"\n{'='*50}")
+    print(f"🤖 REACT MODE - Step {current_step + 1}")
+    print(f"{'='*50}")
 
     callback = state.get("callback")
 
-    # Notify callback about fallback
-    if callback:
-        callback(state, "fallback", {
-            "step": state.get("current_step", 0),
-            "message": "⚠️ Falling back to React mode (basic operations)",
-            "action_type": "fallback",
-        })
+    # Notify callback about fallback (only on first entry)
+    if current_step == 0:
+        if callback:
+            callback(state, "fallback", {
+                "step": current_step,
+                "message": "⚠️ Falling back to React mode (basic operations)",
+                "action_type": "fallback",
+            })
 
-    # Call fallback_to_react function
+    # Call fallback_to_react function - executes ONE step
     state = fallback_to_react(state)
 
-    # Mark task as completed
-    state["completed"] = True
+    # Get updated step count after action
+    new_step = state.get("current_step", 0)
 
-    # Notify callback about fallback completion
+    # NOTE: Do NOT mark completion here when agent signals TASK_COMPLETE.
+    # The check_task_completion node will properly verify with the judge LLM.
+    # This matches the exploration phase behavior where tsk_completed() handles judgment.
+    if state.get("agent_signals_complete", False):
+        print(f"✓ Agent signaled TASK_COMPLETE at step {new_step} - will verify with judge LLM")
+        # Don't set state["completed"] = True here, let check_task_completion handle it
+
+    # Safety limit: prevent infinite loops (only set completed here as last resort)
+    max_react_steps = 20
+    if new_step >= max_react_steps:
+        print(f"⚠️ Hit React mode safety limit ({max_react_steps} steps), forcing completion")
+        state["completed"] = True
+
+    print(f"📍 React mode step {new_step} complete - proceeding to completion check")
+
+    # Notify callback about fallback step completion
     if callback:
         callback(state, "fallback", {
-            "step": state.get("current_step", 0),
-            "message": f"React mode execution status: {state.get('execution_status', 'unknown')}",
+            "step": new_step,
+            "message": f"React mode step {new_step} - Status: {state.get('execution_status', 'unknown')}",
             "action_type": "fallback",
             "status": state.get("execution_status", "unknown"),
             "screenshot_path": state.get("current_page", {}).get("screenshot"),
+            "agent_signals_complete": state.get("agent_signals_complete", False),
         })
 
     return state
@@ -2053,9 +2318,13 @@ def fallback_node(state: DeploymentState) -> DeploymentState:
 # Routing functions
 def should_fallback(state: DeploymentState) -> str:
     """
-    Decide whether to fall back to basic operations
+    Decide whether to fall back to basic operations.
+    Once in React mode, stay in React mode.
     """
-    if state["should_fallback"]:
+    # If we're already in React mode, stay in fallback loop
+    if state.get("in_react_mode", False):
+        return "fallback"
+    if state.get("should_fallback", False):
         return "fallback"
     return "continue"
 
@@ -2145,7 +2414,14 @@ def build_workflow() -> StateGraph:
 
 def check_task_completion(state: DeploymentState) -> DeploymentState:
     """
-    Determine if task is completed
+    Determine if task is completed.
+
+    Only invokes the judge LLM when:
+    1. The agent signals task completion (TASK_COMPLETE: YES), OR
+    2. The safety limit is reached (step >= 20)
+
+    This optimization avoids expensive LLM calls at every step.
+    Matches the exploration phase behavior in tsk_completed().
 
     Args:
         state: Execution state
@@ -2153,44 +2429,89 @@ def check_task_completion(state: DeploymentState) -> DeploymentState:
     Returns:
         Updated execution state with task completion status
     """
-    # Skip judgment if too few steps
+    callback = state.get("callback")
+
+    # Skip judgment if too few steps (allow at least 2 steps before any check)
     if state["current_step"] < 2:
         return state
+
+    # Check if agent signaled completion
+    agent_signals_complete = state.get("agent_signals_complete", False)
+
+    # Only invoke judge LLM if agent signals completion OR safety limit reached
+    max_steps = 20
+    if not agent_signals_complete and state["current_step"] < max_steps:
+        # Agent hasn't signaled completion and we're under safety limit - continue working
+        print(f"📍 Step {state['current_step']}: Agent has not signaled completion, continuing to next action...")
+        print(f"   (Will loop back to capture_screen → fallback for next step)")
+        return state
+
+    if state["current_step"] >= max_steps:
+        print(f"⚠️ Step {state['current_step']}: Safety limit reached, invoking judge")
+    else:
+        print(f"✓ Step {state['current_step']}: Agent signaled TASK_COMPLETE, invoking judge to verify")
 
     print("🔍 Evaluating if task is completed...")
 
     # Get task description
     task = state["task"]
 
-    # Step 1: Generate task completion criteria
-    completion_prompt = ChatPromptTemplate.from_messages(
-        [
-            (
-                "system",
-                "You are an assistant that will help analyze task completion criteria. Please carefully read the following user task:",
-            ),
-            (
-                "human",
-                f"The user's task is: {task}\nPlease describe clear, checkable task completion criteria. For example: 'When certain elements or states appear on the page, it indicates the task is complete.'",
-            ),
-        ]
+    # CRITICAL: Take a FRESH screenshot BEFORE judgment to see CURRENT state
+    # This matches exploration mode's tsk_completed() behavior (lines 422-438)
+    print("📸 Taking fresh screenshot for judgment...")
+    current_screenshot = take_screenshot.invoke(
+        {
+            "device": state["device"],
+            "app_name": state.get("app_name", "deployment"),
+            "step": state["current_step"],
+            "task_id": state.get("task_id"),
+        }
     )
 
-    completion_chain = completion_prompt | model | StrOutputParser()
-    completion_criteria = completion_chain.invoke({})
+    if current_screenshot and os.path.exists(current_screenshot):
+        # Also parse the screen to update state
+        screen_result = screen_element.invoke({"image_path": current_screenshot})
+        state["current_page"]["screenshot"] = current_screenshot
+        state["current_page"]["elements_json"] = screen_result.get("parsed_content_json_path")
+        print(f"✓ Fresh screenshot captured: {current_screenshot}")
+    else:
+        print("⚠️ Failed to capture fresh screenshot, using existing data")
 
-    # Collect recent screenshots
+    # Step 1: Generate task completion criteria (like exploration mode)
+    reflection_messages = [
+        SystemMessage(
+            content="You are a task completion analyst. Generate SPECIFIC, VERIFIABLE criteria for determining when a task is fully complete."
+        ),
+        HumanMessage(
+            content=f"The user's task is: {task}\n\n"
+            f"What is the user's INTENDED OUTCOME? What would success look like?\n"
+            f"Generate clear completion criteria - describe what MUST be visible on screen to confirm the task achieved its intended result.\n"
+            f"Focus on the FINAL outcome, not intermediate steps."
+        ),
+    ]
+
+    reflection_response = model.invoke(reflection_messages)
+    completion_criteria = extract_text_content(reflection_response.content)
+    print(f"📋 Completion criteria: {completion_criteria[:200]}...")
+
+    # Collect recent screenshots: 2 from history + current fresh screenshot
     recent_screenshots = []
-    for step in state["history"][-3:]:
-        if "screenshot" in step and step["screenshot"]:
+
+    # Add up to 2 previous screenshots from history
+    for step in state["history"][-2:]:
+        if "screenshot" in step and step["screenshot"] and os.path.exists(step["screenshot"]):
             recent_screenshots.append(step["screenshot"])
 
-    if not recent_screenshots:
-        if state["current_page"]["screenshot"]:
-            recent_screenshots.append(state["current_page"]["screenshot"])
+    # Add the CURRENT fresh screenshot as the final (most recent) image
+    if current_screenshot and os.path.exists(current_screenshot):
+        recent_screenshots.append(current_screenshot)
+    elif state["current_page"]["screenshot"] and os.path.exists(state["current_page"]["screenshot"]):
+        recent_screenshots.append(state["current_page"]["screenshot"])
 
     if not recent_screenshots:
         print("⚠️ No screenshots available, cannot determine if task is complete")
+        # Reset agent signal and continue
+        state["agent_signals_complete"] = False
         return state
 
     # Helper function to detect image media type
@@ -2200,12 +2521,17 @@ def check_task_completion(state: DeploymentState) -> DeploymentState:
             return 'image/png'
         elif ext in ['.jpg', '.jpeg']:
             return 'image/jpeg'
+        elif ext == '.gif':
+            return 'image/gif'
+        elif ext == '.webp':
+            return 'image/webp'
         else:
             return 'image/png'  # Default to PNG
 
-    # Build image messages
+    # Build image messages with labels (CURRENT STATE for the last one)
     image_messages = []
     for idx, img_path in enumerate(recent_screenshots, start=1):
+        label = "CURRENT STATE" if idx == len(recent_screenshots) else f"Previous screenshot {idx}"
         if os.path.exists(img_path):
             with open(img_path, "rb") as f:
                 img_data = base64.b64encode(f.read()).decode("utf-8")
@@ -2213,7 +2539,7 @@ def check_task_completion(state: DeploymentState) -> DeploymentState:
             image_messages.append(
                 HumanMessage(
                     content=[
-                        {"type": "text", "text": f"Here is data for screenshot {idx}:"},
+                        {"type": "text", "text": f"Screenshot {idx} ({label}):"},
                         {
                             "type": "image_url",
                             "image_url": {"url": f"data:{img_media_type};base64,{img_data}"},
@@ -2222,42 +2548,75 @@ def check_task_completion(state: DeploymentState) -> DeploymentState:
                 )
             )
 
-    # Step 2: Determine if task is complete
-    judgement_prompt = ChatPromptTemplate.from_messages(
-        [
-            (
-                "system",
-                "You are a page assessment assistant that will determine if a task is complete based on completion criteria and current page screenshots. Please only respond with 'yes' or 'no'.",
-            ),
-            (
-                "human",
-                f"The completion criteria is: {completion_criteria}\n"
-                f"Based on the following screenshots, determine if the task is complete. Note that if screenshots are identical, it may indicate the task cannot proceed, so respond with 'yes' to end the program.",
-            ),
-        ]
-    )
+    # Step 2: Rigorous judgment (matching exploration mode's strict prompt)
+    judgement_messages = [
+        SystemMessage(
+            content="""You are a strict task completion judge. Evaluate whether the user's intended task has been FULLY accomplished based on what is visible on screen.
 
-    # Combine all messages
-    all_messages = list(judgement_prompt.messages) + image_messages
+KEY PRINCIPLES:
+1. Consider the user's INTENT, not just the literal words. What outcome were they trying to achieve?
+2. Distinguish between INTERMEDIATE states and FINAL outcomes. A task is only complete when the intended result is achieved.
+3. If an action was initiated but not yet executed/confirmed, the task is NOT complete.
+4. Partial completion is NOT completion. ALL parts of a multi-step task must be done.
+5. Look at the CURRENT STATE screenshot carefully - does it show the expected end result?
+
+You must provide your reasoning FIRST, then give your final answer.
+Format your response as:
+REASONING: [Your detailed analysis of what you see on the current screen and whether it shows the intended outcome was achieved]
+VERDICT: [yes/no]"""
+        ),
+        HumanMessage(
+            content=f"TASK: {task}\n\n"
+            f"COMPLETION CRITERIA: {completion_criteria}\n\n"
+            f"Analyze the screenshots (especially the CURRENT STATE - the last screenshot).\n"
+            f"Ask yourself: Does the screen show that the user's intended outcome was achieved? Or is it still in an intermediate state?"
+        ),
+    ] + image_messages
 
     # Call LLM for judgment
-    judgement_response = model.invoke(all_messages)
+    judgement_response = model.invoke(judgement_messages)
     judgement_answer = extract_text_content(judgement_response.content)
+    print(f"🔍 Judge response: {judgement_answer[:300]}...")
+
+    # Parse the verdict from the response (matching exploration mode's logic)
+    verdict_completed = False
+    if "VERDICT:" in judgement_answer.upper():
+        verdict_part = judgement_answer.upper().split("VERDICT:")[-1].strip()
+        if verdict_part.startswith("YES"):
+            verdict_completed = True
+    elif "yes" in judgement_answer.lower() and "no" not in judgement_answer.lower():
+        # Fallback for responses without proper format
+        verdict_completed = True
 
     # Update task completion status
-    if "yes" in judgement_answer.lower() or "complete" in judgement_answer.lower():
+    if verdict_completed:
         state["completed"] = True
         state["execution_status"] = "completed"
-        print(f"✓ Task completed: {judgement_answer}")
+        print(f"✓ Task COMPLETED (verified by judge)")
     else:
         state["completed"] = False
-        print(f"⚠️ Task not completed: {judgement_answer}")
+        print(f"⚠️ Task NOT complete - continuing execution")
+
+    # Reset agent signal after judgment so we don't keep triggering
+    state["agent_signals_complete"] = False
+
+    # Call callback for UI logging
+    if callback:
+        callback(state, "task_judgment", {
+            "step": state["current_step"],
+            "message": f"🔍 Task Completion Check",
+            "completion_criteria": completion_criteria,
+            "judge_reasoning": judgement_answer,
+            "verdict": "COMPLETE" if verdict_completed else "NOT COMPLETE",
+            "screenshot_path": current_screenshot if current_screenshot else state["current_page"]["screenshot"],
+        })
 
     # Add to history
     state["history"].append(
         {
             "step": state["current_step"],
             "action": "task_completion_check",
+            "screenshot": current_screenshot,
             "completion_criteria": completion_criteria,
             "judgement": judgement_answer,
             "status": "success",

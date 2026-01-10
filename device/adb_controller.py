@@ -1,13 +1,18 @@
 import subprocess
 import datetime
 import os
+import logging
 from pathlib import Path
 from typing import Tuple, Optional, List
 from time import sleep
 
+# Setup logging
+logger = logging.getLogger(__name__)
+
 
 def execute_adb(adb_command: str) -> str:
     """Execute an ADB command and return the output."""
+    logger.info(f"🔧 ADB COMMAND: {adb_command}")
     result = subprocess.run(
         adb_command,
         shell=True,
@@ -16,7 +21,9 @@ def execute_adb(adb_command: str) -> str:
         text=True,
     )
     if result.returncode == 0:
+        logger.info(f"✅ ADB SUCCESS: returncode=0, stdout={result.stdout.strip()[:100]}")
         return result.stdout.strip()
+    logger.error(f"❌ ADB FAILED: returncode={result.returncode}, stderr={result.stderr}")
     print(f"Command execution failed: {adb_command}")
     print(result.stderr)
     return "ERROR"
@@ -121,9 +128,12 @@ class ADBController:
         Returns:
             True if successful, False otherwise.
         """
+        logger.info(f"🖱️ ADBController.tap called: device={self.device_id}, x={x}, y={y}")
         adb_command = f"adb -s {self.device_id} shell input tap {x} {y}"
         result = execute_adb(adb_command)
-        return result != "ERROR"
+        success = result != "ERROR"
+        logger.info(f"🖱️ ADBController.tap result: success={success}")
+        return success
 
     def long_press(self, x: int, y: int, duration_ms: int = 1000) -> bool:
         """

@@ -1,4 +1,11 @@
+import base64
+import datetime
+import json
 import logging
+import os
+
+import config
+from PIL import Image, ImageDraw, ImageFont
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_anthropic import ChatAnthropic
 from langgraph.graph import StateGraph, START, END
@@ -6,10 +13,173 @@ from langgraph.prebuilt import create_react_agent
 from langgraph.types import RetryPolicy
 from pydantic import SecretStr
 from data.State import State
-from tool.screen_content import *
+from tool.screen_content import (
+    screen_action,
+    request_completion_check,
+    take_screenshot,
+    get_device_size,
+    set_controller,
+    set_square_coords,
+)
 
 # Setup logging
 logger = logging.getLogger(__name__)
+
+
+def get_dominant_color(img: Image.Image, threshold: float = 0.15) -> tuple:
+    """
+    Analyze image to find the dominant (most common) color.
+
+    Args:
+        img: PIL Image to analyze
+        threshold: Minimum percentage of pixels required to consider a color dominant
+
+    Returns:
+        Tuple of (r, g, b) for dominant color, or None if no dominant color found
+    """
+    # Resize for faster analysis
+    small = img.copy()
+    small.thumbnail((100, 100))
+
+    # Get all pixels
+    pixels = list(small.getdata())
+    total_pixels = len(pixels)
+
+    # Quantize colors to reduce unique colors (bin into 32-color buckets)
+    def quantize(color):
+        if len(color) == 4:  # RGBA
+            r, g, b, a = color
+        else:  # RGB
+            r, g, b = color
+        return (r // 32 * 32, g // 32 * 32, b // 32 * 32)
+
+    # Count color frequencies
+    color_counts = {}
+    for pixel in pixels:
+        q = quantize(pixel)
+        color_counts[q] = color_counts.get(q, 0) + 1
+
+    # Find most common color
+    if not color_counts:
+        return None
+
+    most_common = max(color_counts.items(), key=lambda x: x[1])
+    most_common_color, count = most_common
+
+    # Check if it exceeds threshold
+    if count / total_pixels >= threshold:
+        return most_common_color
+    return None
+
+
+def get_complement_color(color: tuple) -> tuple:
+    """Get the complement (opposite) color."""
+    r, g, b = color
+    return (255 - r, 255 - g, 255 - b)
+
+
+def add_coordinate_grid(image_path: str, save_path: str = None, cols: int = 9, rows: int = 22) -> tuple[str, dict]:
+    """
+    Add a numbered grid overlay to an image to help Claude identify tap locations.
+
+    Divides the screen into numbered squares. Claude identifies which square contains
+    the target element, and we tap the center of that square programmatically.
+
+    Args:
+        image_path: Path to the original screenshot
+        save_path: Optional path to save the gridded image (defaults to adding _grid suffix)
+        cols: Number of columns in the grid (default 9 for ~120px cells on 1080 width)
+        rows: Number of rows in the grid (default 22 for ~109px cells on 2400 height)
+
+    Returns:
+        Tuple of (path to gridded image, dict mapping square numbers to center coordinates)
+    """
+    img = Image.open(image_path).convert("RGBA")
+    width, height = img.size
+
+    # Create a transparent overlay for the grid
+    overlay = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+
+    # Calculate cell dimensions
+    cell_width = width / cols
+    cell_height = height / rows
+
+    # Determine grid line color based on dominant background color
+    dominant = get_dominant_color(img)
+    if dominant:
+        complement = get_complement_color(dominant)
+        line_color = (*complement, 180)  # Use complement with alpha
+        logger.info(f"Dominant color: {dominant}, using complement: {complement}")
+    else:
+        line_color = (0, 255, 0, 180)  # Default to green
+        logger.info("No dominant color found, using default green")
+
+    # Try to load a font - smaller size for top-left positioning
+    try:
+        font_size = min(int(cell_width * 0.22), int(cell_height * 0.22), 18)
+        font_size = max(font_size, 12)  # Minimum readable size
+        font = ImageFont.truetype("/System/Library/Fonts/Helvetica.ttc", font_size)
+    except:
+        font = ImageFont.load_default()
+
+    # Colors for text - always dark background for visibility
+    text_bg = (0, 0, 0, 200)  # Dark background
+    text_color = (255, 255, 255)  # White text for contrast
+
+    # Build mapping of square numbers to center coordinates
+    square_coords = {}
+
+    # Draw grid and number each square
+    square_num = 1
+    for row in range(rows):
+        for col in range(cols):
+            # Calculate cell boundaries
+            x1 = int(col * cell_width)
+            y1 = int(row * cell_height)
+            x2 = int((col + 1) * cell_width)
+            y2 = int((row + 1) * cell_height)
+
+            # Calculate center of cell (for tapping)
+            center_x = (x1 + x2) // 2
+            center_y = (y1 + y2) // 2
+            square_coords[square_num] = {"x": center_x, "y": center_y}
+
+            # Draw cell border
+            draw.rectangle([(x1, y1), (x2, y2)], outline=line_color, width=2)
+
+            # Draw square number in TOP-LEFT corner with dark background
+            label = str(square_num)
+            bbox = draw.textbbox((0, 0), label, font=font)
+            text_width = bbox[2] - bbox[0]
+            text_height = bbox[3] - bbox[1]
+
+            # Position at top-left with small padding
+            padding = 2
+            label_x = x1 + padding + 2
+            label_y = y1 + padding + 2
+
+            # Draw dark background rectangle for number
+            draw.rectangle(
+                [(label_x - padding, label_y - padding),
+                 (label_x + text_width + padding, label_y + text_height + padding)],
+                fill=text_bg
+            )
+            draw.text((label_x, label_y), label, fill=text_color, font=font)
+
+            square_num += 1
+
+    # Composite the overlay onto the original image
+    img = Image.alpha_composite(img, overlay)
+    img = img.convert("RGB")
+
+    # Save gridded image
+    if save_path is None:
+        base, ext = os.path.splitext(image_path)
+        save_path = f"{base}_grid{ext}"
+
+    img.save(save_path)
+    return save_path, square_coords
 
 
 def extract_text_content(content):
@@ -92,8 +262,20 @@ def tsk_setting(state: State):
 
 def page_understand(state: State):
     """
-    Understand the current page
+    Capture the current screen - Claude will analyze the raw screenshot directly
+    (OmniParser removed - Claude's vision handles element detection)
     """
+    import time
+    step_num = state["step"]
+
+    # Log: Starting screenshot capture
+    if state.get("callback"):
+        state["callback"](state, node_name="page_understand_start", info={
+            "step": step_num,
+            "message": f"📸 Step {step_num}: Taking screenshot via ADB...",
+        })
+
+    screenshot_start = time.time()
     screen_img = take_screenshot.invoke(
         {
             "device": state["device"],
@@ -102,28 +284,25 @@ def page_understand(state: State):
             "task_id": state.get("task_id"),
         }
     )
-    screen_result = screen_element.invoke(
-        {
-            "image_path": screen_img,
-        }
-    )
+    screenshot_elapsed = time.time() - screenshot_start
+
     state["current_page_screenshot"] = screen_img
-    state["current_page_json"] = screen_result["parsed_content_json_path"]
 
     # Add tool result to state BEFORE calling callback so screenshots are available
     if not isinstance(state["tool_results"], list):
         state["tool_results"] = []
 
     state["tool_results"].append(
-        {"tool_name": "screen_element", "result": screen_result}
+        {"tool_name": "screenshot", "result": {"screenshot_path": screen_img}}
     )
 
     # Call the callback function (if any) - AFTER tool_results are updated
     if state.get("callback"):
         callback_info = {
-            "labeled_image_path": screen_result.get("labeled_image_path"),
-            "step": state["step"],
-            "message": f"📷 Step {state['step']}: Captured and analyzed screenshot",
+            "labeled_image_path": screen_img,  # Use raw screenshot
+            "step": step_num,
+            "message": f"📷 Step {step_num}: Screenshot captured in {screenshot_elapsed:.1f}s",
+            "screenshot_time": screenshot_elapsed,
         }
         state["callback"](state, node_name="page_understand", info=callback_info)
 
@@ -133,23 +312,18 @@ def page_understand(state: State):
 def perform_action(state: State):
     """
     Perform actions based on the current state
-    Specifically, this node does two things:
-    1. Use LLM to understand the interface and generate recommended actions (based on the current page screenshot, parsed JSON, and user intent)
-    2. Execute the recommended action (by calling the relevant tools through the React agent)
-
-    In this step:
-    - Need to get the annotated screenshot and parsed JSON result from state
-    - Pass these data along with the user's intent to LLM, let React agent analyze and decide
-    - Execute the corresponding tool operation
-    - Update state's step count, history information, etc.
+    Claude analyzes the raw screenshot directly and decides what action to take.
+    No external parsing - Claude's vision capabilities handle element detection.
     """
 
     # Create action_agent, used for decision making and executing operations on the page
-    action_agent = create_react_agent(model, [screen_action])
+    # Tools available: screen_action (for device interaction) and request_completion_check (to signal task done)
+    tools = [screen_action, request_completion_check]
+    model_with_tools = model.bind_tools(tools)
+    action_agent = create_react_agent(model_with_tools, tools)
 
-    # Get the annotated screenshot path and parsed JSON data from state
-    labeled_image_path = state.get("current_page_screenshot")
-    json_labeled_path = state.get("current_page_json")
+    # Get the screenshot path from state
+    screenshot_path = state.get("current_page_screenshot")
     user_intent = state.get("tsk", "No specific task")
     device = state.get("device", "Unknown device")
     device_size = state.get("device_info", {})
@@ -168,54 +342,74 @@ def perform_action(state: State):
         else:
             return 'image/png'  # Default to PNG
 
-    # Read screenshot file and encode to base64
-    with open(labeled_image_path, "rb") as f:
+    # Create numbered grid overlay - returns path and square-to-coordinates mapping
+    gridded_screenshot_path, square_coords = add_coordinate_grid(screenshot_path)
+    logger.info(f"Created gridded screenshot with {len(square_coords)} numbered squares: {gridded_screenshot_path}")
+
+    # Store square_coords in state for reference
+    state["square_coords"] = square_coords
+
+    # Set square coords in the tool module so screen_action can translate squares to coordinates
+    set_square_coords(square_coords)
+
+    # Show the gridded image in UI BEFORE sending to Claude (so user can verify what Claude sees)
+    if state.get("callback"):
+        state["callback"](state, node_name="gridded_screenshot", info={
+            "step": state["step"],
+            "labeled_image_path": gridded_screenshot_path,
+            "message": f"🔲 Step {state['step']}: Numbered grid overlay ({len(square_coords)} squares) - this is what Claude will see",
+        })
+
+    # Read GRIDDED screenshot file and encode to base64
+    with open(gridded_screenshot_path, "rb") as f:
         image_content = f.read()
     image_data = base64.b64encode(image_content).decode("utf-8")
-    image_media_type = get_image_media_type(labeled_image_path)
+    image_media_type = get_image_media_type(gridded_screenshot_path)
+    logger.info(f"Sending gridded image to Claude: {len(image_data)} bytes base64")
 
-    # Read parsed JSON file content
-    with open(json_labeled_path, "r", encoding="utf-8") as f:
-        page_json = f.read()
-
-    # Build message list to pass to LLM, including user intent, page parsed result, and screenshot information
+    # Build message list - Claude analyzes the screenshot with numbered grid
     messages = [
         SystemMessage(
-            content="""You are an AI agent controlling a mobile device. Analyze the current screen and determine the SINGLE next action to take.
+            content=f"""You are an AI agent controlling a mobile device. Analyze the screenshot and perform ONE action.
 
-IMPORTANT RULES:
-1. THINK STEP-BY-STEP: Before acting, explain what you see on screen and why you're taking this action.
-2. ONE ACTION AT A TIME: Only perform ONE action per turn.
-3. TAP BEFORE TYPING: You MUST tap on a text input field to focus it BEFORE you can type text into it. Never use the "text" action unless you have already tapped on an input field in a PREVIOUS step.
-4. VERIFY FOCUS: If you need to enter text, first tap the input field. Only type text AFTER confirming the field is focused.
-5. BE PRECISE: Use the element IDs and bounding boxes to calculate exact tap coordinates.
+AVAILABLE TOOLS:
+1. screen_action - Interact with the device. For tap/long_press/swipe: provide the "square" parameter with the grid square number. For text: provide "input_str". For back/enter: no extra params needed.
+2. request_completion_check - Call this when you believe the task is FULLY complete and you can SEE the result
 
-TASK COMPLETION:
-- If you believe the task has been FULLY completed (the intended outcome is visible on screen), include "TASK_COMPLETE: YES" at the END of your response.
-- Only signal completion when the FINAL desired outcome is achieved, not intermediate steps.
-- If you're still working toward the goal, do NOT include any TASK_COMPLETE signal.
+NUMBERED GRID SYSTEM:
+The screenshot is divided into {len(square_coords)} NUMBERED SQUARES. Each square has a small number label in its top-left corner.
+To interact with an element, simply identify which numbered square contains your target element and provide that square number to screen_action.
+The system will automatically translate the square number to the correct screen coordinates.
 
-FORMAT YOUR RESPONSE:
-- First, describe what you observe on the current screen
-- Then, explain your reasoning for the next action
-- Execute the action using the appropriate tool
-- If task is done, end with: TASK_COMPLETE: YES
+HOW TO USE:
+1. Find the UI element you want to interact with
+2. Identify which NUMBERED SQUARE contains that element (look at the number in the top-left of the square)
+3. Call screen_action with action="tap" and square=<number>
 
-All tool calls must include device to specify the operation device. Only execute one tool call."""
+RESPONSE FORMAT:
+<reasoning>
+1. OBSERVATION: Describe what you see on the current screen
+2. ANALYSIS: Based on the task, what needs to happen next?
+3. TARGET: Which UI element? Which square number contains it?
+4. ACTION: What action and square number?
+</reasoning>
+
+Then call screen_action with the square number. Example: screen_action(device="...", action="tap", square=75)
+
+RULES:
+1. Execute exactly ONE tool call per turn
+2. Do not assume actions succeeded - verify in the next screenshot
+3. For tap/long_press/swipe: use the "square" parameter, NOT x/y coordinates
+4. Call request_completion_check only when you can SEE the task is complete"""
         ),
         HumanMessage(
-            content=f"The current device is: {device}, the screen size of the device is {device_size}."
-            f"The current task intent is: {user_intent}"
-        ),
-        HumanMessage(
-            content="Below is the parsed JSON data of the current page (the bbox is relative, please convert it to actual operation position based on screen size): \n"
-            + page_json
+            content=f"Device: {device}\nScreen size: {device_size}\nTask: {user_intent}"
         ),
         HumanMessage(
             content=[
                 {
                     "type": "text",
-                    "text": "Below is the base64 data of the annotated page screenshot:",
+                    "text": "Current screenshot with NUMBERED GRID. Each square has a number in its top-left corner. Find your target element and identify which square number contains it:",
                 },
                 {
                     "type": "image_url",
@@ -228,8 +422,18 @@ All tool calls must include device to specify the operation device. Only execute
     # Add these messages to state's context for maintaining dialog continuity
     state["context"].extend(messages)
 
+    # Log: LLM is analyzing and deciding action
+    if state.get("callback"):
+        state["callback"](state, node_name="action_agent_thinking", info={
+            "step": state["step"],
+            "message": f"🤔 Step {state['step']}: Claude is analyzing screen and deciding next action...",
+        })
+
     # Call action_agent for decision and execute operation
+    import time
+    llm_start = time.time()
     action_result = action_agent.invoke({"messages": state["context"][-4:]})
+    llm_elapsed = time.time() - llm_start
 
     # The last message of final_message as the final decision output
     final_messages = action_result.get("messages", [])
@@ -246,48 +450,95 @@ All tool calls must include device to specify the operation device. Only execute
         )
         return state
 
-    # Extract LLM reasoning - look for the AI message BEFORE tool execution
-    # Message flow: [input msgs...] -> AI (reasoning) -> Tool (result) -> AI (summary)
+    # Extract LLM reasoning - only the PRE-ACTION reasoning (before tool execution)
+    # Message flow: [context msgs...] -> AI (reasoning + tool_call) -> Tool (result) -> AI (summary)
+    # IMPORTANT: After step 0, the first AI message may be stale from context.
+    # The actual reasoning is in the AI message that has BOTH content AND tool_calls.
     llm_reasoning = ""
     ai_messages = [msg for msg in final_messages if msg.type == "ai"]
-    if ai_messages:
-        # First AI message contains the reasoning before tool call
-        first_ai_msg = ai_messages[0]
-        if hasattr(first_ai_msg, 'content') and first_ai_msg.content:
-            llm_reasoning = extract_text_content(first_ai_msg.content)
-        # If there's a second AI message, that's the summary after tool call
-        if len(ai_messages) > 1:
-            summary_msg = ai_messages[-1]
-            if hasattr(summary_msg, 'content') and summary_msg.content:
-                llm_reasoning += f"\n\n[After action]: {extract_text_content(summary_msg.content)}"
+
+    logger.info(f"🔍 DEBUG: Found {len(ai_messages)} AI messages in action_result")
+    for i, msg in enumerate(ai_messages):
+        content_preview = str(msg.content)[:200] if msg.content else "EMPTY"
+        has_tool_calls = hasattr(msg, 'tool_calls') and msg.tool_calls
+        logger.info(f"🔍 DEBUG: AI msg {i}: content={content_preview}, has_tool_calls={has_tool_calls}")
+
+    # Find the AI message that has BOTH content AND tool_calls - that's the reasoning message
+    reasoning_msg = None
+    for msg in ai_messages:
+        has_content = hasattr(msg, 'content') and msg.content
+        has_tool_calls = hasattr(msg, 'tool_calls') and msg.tool_calls
+        if has_content and has_tool_calls:
+            reasoning_msg = msg
+            break
+
+    if reasoning_msg:
+        llm_reasoning = extract_text_content(reasoning_msg.content)
+        logger.info(f"🔍 DEBUG: Found reasoning message with tool_calls: {llm_reasoning[:100]}...")
+    elif ai_messages:
+        # Fallback: try first AI message with non-empty content
+        for msg in ai_messages:
+            if hasattr(msg, 'content') and msg.content:
+                content = extract_text_content(msg.content)
+                if content and '<reasoning>' in content.lower():
+                    llm_reasoning = content
+                    break
+
+        # If still no reasoning, try to build from tool_calls
+        if not llm_reasoning:
+            for msg in ai_messages:
+                if hasattr(msg, 'tool_calls') and msg.tool_calls:
+                    tool_call = msg.tool_calls[0]
+                    tool_name = tool_call.get('name', 'unknown')
+                    tool_args = tool_call.get('args', {})
+                    if tool_name == 'screen_action':
+                        action = tool_args.get('action', 'unknown')
+                        x = tool_args.get('x', '?')
+                        y = tool_args.get('y', '?')
+                        llm_reasoning = f"[Tool call: {action} at ({x}, {y})]"
+                    else:
+                        llm_reasoning = f"[Tool call: {tool_name}]"
+                    logger.info(f"🔍 DEBUG: Extracted reasoning from tool_calls: {llm_reasoning}")
+                    break
 
     # Fallback to last message if no reasoning found
     recommended_action = llm_reasoning if llm_reasoning else extract_text_content(final_messages[-1].content)
+    logger.info(f"🔍 DEBUG: Final reasoning: {recommended_action[:200] if recommended_action else 'EMPTY'}")
     state["recommend_action"] = recommended_action
-
-    # Check if agent signals task completion
-    agent_signals_complete = False
-    for msg in ai_messages:
-        if hasattr(msg, 'content') and msg.content:
-            msg_text = extract_text_content(msg.content).upper()
-            if "TASK_COMPLETE: YES" in msg_text or "TASK_COMPLETE:YES" in msg_text:
-                agent_signals_complete = True
-                logger.info("Action agent signaled TASK_COMPLETE: YES")
-                break
-    state["agent_signals_complete"] = agent_signals_complete
 
     # Parse all tool_messages to get tool execution results
     tool_messages = [msg for msg in final_messages if msg.type == "tool"]
+    logger.info(f"🔍 DEBUG: Found {len(tool_messages)} tool messages in action_result")
     tool_output = {}
+    agent_signals_complete = False
+    completion_check_reason = ""
+
     for tool_message in tool_messages:
-        tool_output.update(json.loads(tool_message.content))
+        logger.info(f"🔍 DEBUG: Tool message content: {tool_message.content}")
+        try:
+            parsed_output = json.loads(tool_message.content)
+            # Check if this is the completion check tool
+            if parsed_output.get("tool") == "request_completion_check" or parsed_output.get("status") == "completion_check_requested":
+                agent_signals_complete = True
+                completion_check_reason = parsed_output.get("reason", "")
+                logger.info(f"🔍 Agent called request_completion_check tool: {completion_check_reason}")
+                print(f"🔍 [COMPLETION CHECK TOOL CALLED] Reason: {completion_check_reason}")
+            else:
+                # Regular tool output (screen_action)
+                tool_output.update(parsed_output)
+        except (json.JSONDecodeError, TypeError) as e:
+            logger.warning(f"Failed to parse tool message: {e}")
+
+    state["agent_signals_complete"] = agent_signals_complete
+    if completion_check_reason:
+        state["completion_check_reason"] = completion_check_reason
 
     if tool_output:
         # Ensure tool_results is a list
         if not isinstance(state["tool_results"], list):
             state["tool_results"] = []
         # Add tool name for front-end recognition
-        tool_output["tool_name"] = "screen_action"  # Or other corresponding tool name
+        tool_output["tool_name"] = tool_output.get("action", "screen_action")
         state["tool_results"].append(tool_output)
 
     # Add this operation record to history step record for future query
@@ -312,28 +563,41 @@ All tool calls must include device to specify the operation device. Only execute
             action_type = tool_output.get("action", "unknown")
             if action_type == "tap":
                 coords = tool_output.get("clicked_element", {})
-                action_details = f"🖱️ TAP at ({coords.get('x', '?')}, {coords.get('y', '?')})"
+                square_num = tool_output.get("square", "?")
+                action_details = f"🖱️ TAP square {square_num} → ({coords.get('x', '?')}, {coords.get('y', '?')})"
             elif action_type == "text":
                 text = tool_output.get("input_str", "")
                 action_details = f"⌨️ TYPE: \"{text}\""
             elif action_type == "swipe":
                 direction = tool_output.get("direction", "?")
-                action_details = f"👆 SWIPE {direction}"
+                square_num = tool_output.get("square", "?")
+                action_details = f"👆 SWIPE {direction} from square {square_num}"
             elif action_type == "long_press":
                 coords = tool_output.get("long_press", {})
-                action_details = f"👆 LONG PRESS at ({coords.get('x', '?')}, {coords.get('y', '?')})"
+                square_num = tool_output.get("square", "?")
+                action_details = f"👆 LONG PRESS square {square_num} → ({coords.get('x', '?')}, {coords.get('y', '?')})"
             elif action_type == "back":
                 action_details = "⬅️ BACK button pressed"
+            elif action_type == "enter":
+                action_details = "⏎ ENTER key pressed"
             else:
                 action_details = f"Action: {action_type}"
+
+        # Get ADB command from tool output (for debugging)
+        adb_command = tool_output.get("adb_command", "") if tool_output else ""
+        adb_status = tool_output.get("status", "unknown") if tool_output else "no_tool"
 
         callback_info = {
             "step": state["step"] - 1,  # Show the step we just completed
             "llm_reasoning": recommended_action,
             "action_details": action_details,
             "tool_output": tool_output,
-            "labeled_image_path": state.get("current_page_screenshot"),
+            "labeled_image_path": gridded_screenshot_path,  # Show gridded image in UI
             "message": f"🤖 Step {state['step'] - 1}: {action_details}",
+            "llm_time": llm_elapsed,
+            # ADB debugging info - shows the actual command executed
+            "adb_command": adb_command,
+            "adb_status": adb_status,
         }
         state["callback"](state, node_name="perform_action", info=callback_info)
 
@@ -382,13 +646,7 @@ def tsk_completed(state: State):
             "task_id": state.get("task_id"),
         }
     )
-    current_screen_result = screen_element.invoke(
-        {
-            "image_path": current_screen_img,
-        }
-    )
     state["current_page_screenshot"] = current_screen_img
-    state["current_page_json"] = current_screen_result["parsed_content_json_path"]
 
     # First step: let LLM reflect on user task, generate task completion judgment criteria
     reflection_messages = [

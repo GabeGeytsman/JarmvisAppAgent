@@ -1,6 +1,7 @@
 import base64
 import datetime
 import json
+import logging
 import os
 from pathlib import Path
 from typing import Dict, Optional, TYPE_CHECKING
@@ -10,11 +11,17 @@ from langchain_core.tools import tool
 
 import config  # Import configuration module
 
+# Setup logging
+logger = logging.getLogger(__name__)
+
 if TYPE_CHECKING:
     from device.controller import DeviceController
 
 # Module-level controller reference
 _controller: Optional["DeviceController"] = None
+
+# Module-level square coordinates mapping (updated each step)
+_square_coords: Dict[int, Dict[str, int]] = {}
 
 
 def set_controller(controller: "DeviceController"):
@@ -33,6 +40,37 @@ def get_controller() -> "DeviceController":
 def has_controller() -> bool:
     """Check if a controller has been set."""
     return _controller is not None
+
+
+def set_square_coords(coords: Dict[int, Dict[str, int]]):
+    """
+    Set the current square-to-coordinates mapping.
+    Called before each action agent invocation with the current grid's coordinates.
+    """
+    global _square_coords
+    _square_coords = coords
+    logger.info(f"📍 Square coords updated: {len(coords)} squares available")
+
+
+def get_square_coords() -> Dict[int, Dict[str, int]]:
+    """Get the current square coordinates mapping."""
+    return _square_coords
+
+
+def translate_square_to_coords(square: int) -> Optional[tuple]:
+    """
+    Translate a square number to (x, y) coordinates.
+
+    Args:
+        square: The grid square number
+
+    Returns:
+        Tuple of (x, y) coordinates for the center of the square, or None if invalid
+    """
+    if square in _square_coords:
+        coord = _square_coords[square]
+        return (coord["x"], coord["y"])
+    return None
 
 
 # Re-export device listing from the device module for backwards compatibility
@@ -231,6 +269,7 @@ def screen_element(image_path: str) -> Dict:
 def screen_action(
     device: str = "emulator",
     action: str = "tap",
+    square: int = None,
     x: int = None,
     y: int = None,
     input_str: str = None,
@@ -242,30 +281,54 @@ def screen_action(
     end: tuple = None,
 ) -> str:
     """
-    Perform screen operations on devices, including tap, back, text, swipe, long press, and drag.
+    Perform screen operations on devices, including tap, back, text, enter, swipe, long press, and drag.
 
     Parameters:
-        - device (str): Device ID (used only in fallback mode)
+        - device (str): Device ID
         - action (str): Type of screen operation:
-            - "tap": Tap at coordinates (requires x, y)
+            - "tap": Tap at a grid square (requires square number)
             - "back": Back key operation
             - "text": Enter text (requires input_str)
-            - "long_press": Long press (requires x, y, optional duration)
-            - "swipe": Swipe in direction (requires x, y, direction)
+            - "enter": Press Enter/Search key (use after typing to submit search or form)
+            - "long_press": Long press at grid square (requires square)
+            - "swipe": Swipe in direction from grid square (requires square, direction)
             - "swipe_precise": Precise swipe (requires start, end)
+        - square (int): Grid square number to interact with. The system automatically translates this to screen coordinates.
 
     Returns:
         JSON string with status and operation details.
     """
+    # Translate square to coordinates if provided
+    if square is not None:
+        coords = translate_square_to_coords(square)
+        if coords:
+            x, y = coords
+            logger.info(f"🎯 Translated square {square} to coordinates ({x}, {y})")
+        else:
+            return json.dumps({
+                "status": "error",
+                "action": action,
+                "device": device,
+                "message": f"Invalid square number: {square}. Square not found in current grid.",
+            })
+
+    logger.info(f"🎯 screen_action CALLED: action={action}, device={device}, square={square}, x={x}, y={y}, input_str={input_str}, direction={direction}")
     try:
         result_data = {"action": action, "device": device}
+        if square is not None:
+            result_data["square"] = square
         success = False
 
         if has_controller():
             controller = get_controller()
+            logger.info(f"📱 Using controller: {controller}")
 
             if action == "back":
+                adb_cmd = f"adb -s {controller.device_id} shell input keyevent KEYCODE_BACK"
+                result_data["adb_command"] = adb_cmd
+                print(f"🔧 [ADB] EXECUTING: {adb_cmd}")
                 success = controller.press_back()
+                print(f"🔧 [ADB] RESULT: {'SUCCESS' if success else 'FAILED'}")
 
             elif action == "tap":
                 if x is None or y is None:
@@ -275,7 +338,13 @@ def screen_action(
                         "device": device,
                         "message": "Missing required parameters for click action (x, y)",
                     })
+                adb_cmd = f"adb -s {controller.device_id} shell input tap {x} {y}"
+                result_data["adb_command"] = adb_cmd
+                print(f"🔧 [ADB] EXECUTING: {adb_cmd}")
+                logger.info(f"👆 Executing TAP at ({x}, {y}) via controller...")
                 success = controller.tap(x, y)
+                print(f"🔧 [ADB] RESULT: {'SUCCESS' if success else 'FAILED'}")
+                logger.info(f"👆 TAP result: success={success}")
                 result_data["clicked_element"] = {"x": x, "y": y}
 
             elif action == "text":
@@ -286,8 +355,23 @@ def screen_action(
                         "device": device,
                         "message": "Missing required parameter for text action (input_str)",
                     })
+                sanitized_text = input_str.replace(" ", "%s").replace("'", "")
+                adb_cmd = f"adb -s {controller.device_id} shell input text {sanitized_text}"
+                result_data["adb_command"] = adb_cmd
+                print(f"🔧 [ADB] EXECUTING: {adb_cmd}")
                 success = controller.input_text(input_str)
+                print(f"🔧 [ADB] RESULT: {'SUCCESS' if success else 'FAILED'}")
                 result_data["input_str"] = input_str
+
+            elif action == "enter":
+                # Press Enter key (useful after typing in search fields)
+                adb_cmd = f"adb -s {controller.device_id} shell input keyevent KEYCODE_ENTER"
+                result_data["adb_command"] = adb_cmd
+                print(f"🔧 [ADB] EXECUTING: {adb_cmd}")
+                logger.info("⏎ Executing ENTER key press via controller...")
+                success = controller.press_enter()
+                print(f"🔧 [ADB] RESULT: {'SUCCESS' if success else 'FAILED'}")
+                logger.info(f"⏎ ENTER result: success={success}")
 
             elif action == "long_press":
                 if x is None or y is None:
@@ -297,7 +381,11 @@ def screen_action(
                         "device": device,
                         "message": "Missing required parameters for long_press action (x, y)",
                     })
+                adb_cmd = f"adb -s {controller.device_id} shell input swipe {x} {y} {x} {y} {duration}"
+                result_data["adb_command"] = adb_cmd
+                print(f"🔧 [ADB] EXECUTING: {adb_cmd}")
                 success = controller.long_press(x, y, duration)
+                print(f"🔧 [ADB] RESULT: {'SUCCESS' if success else 'FAILED'}")
                 result_data["long_press"] = {"x": x, "y": y, "duration": duration}
 
             elif action == "swipe":
@@ -327,7 +415,11 @@ def screen_action(
                         "message": "Invalid direction for swipe",
                     })
                 swipe_duration = 100 if quick else 400
+                adb_cmd = f"adb -s {controller.device_id} shell input swipe {x} {y} {x + offset_x} {y + offset_y} {swipe_duration}"
+                result_data["adb_command"] = adb_cmd
+                print(f"🔧 [ADB] EXECUTING: {adb_cmd}")
                 success = controller.swipe(x, y, x + offset_x, y + offset_y, swipe_duration)
+                print(f"🔧 [ADB] RESULT: {'SUCCESS' if success else 'FAILED'}")
                 result_data["swipe"] = {
                     "start": (x, y),
                     "end": (x + offset_x, y + offset_y),
@@ -481,3 +573,35 @@ def screen_action(
             {"status": "error", "action": action, "device": device, "message": str(e)},
             ensure_ascii=False,
         )
+
+
+@tool
+def request_completion_check(reason: str) -> str:
+    """
+    Request a task completion check from the judge LLM.
+
+    Call this tool ONLY when you believe the task has been fully completed and the
+    expected outcome is visible on the current screen. The judge will take a fresh
+    screenshot and verify whether the task is actually complete.
+
+    Parameters:
+        - reason (str): Brief explanation of why you believe the task is complete.
+                       Describe what you see on screen that indicates success.
+
+    Returns:
+        JSON string indicating the completion check has been requested.
+        The actual judgment will happen after this tool returns.
+
+    IMPORTANT: Only call this when you can SEE the final result on screen.
+    Do not call this immediately after performing an action - wait for the
+    next screenshot to verify the action's result first.
+    """
+    logger.info(f"🔍 COMPLETION CHECK REQUESTED: {reason}")
+    print(f"🔍 [COMPLETION CHECK] Agent requests verification: {reason}")
+
+    return json.dumps({
+        "tool": "request_completion_check",
+        "status": "completion_check_requested",
+        "reason": reason,
+        "message": "Completion check requested. The judge LLM will verify if the task is complete."
+    }, ensure_ascii=False)

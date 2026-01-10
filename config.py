@@ -23,7 +23,7 @@ except ImportError:
 # -----------------------------------------------------------------------------
 # LLM Configuration
 # -----------------------------------------------------------------------------
-LLM_MODEL = "claude-sonnet-4-5-20250929"  # Anthropic Claude Sonnet 4.5 (top-rated for computer use)
+LLM_MODEL = "claude-opus-4-5-20251101"  # Claude Opus 4.5 - more accurate vision/coordinate estimation
 LLM_MAX_TOKEN = 4096
 LLM_REQUEST_TIMEOUT = 500
 LLM_MAX_RETRIES = 3

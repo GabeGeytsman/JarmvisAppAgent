@@ -44,8 +44,13 @@ def state2json(state: State, save_path: str = None) -> str:
     }
 
     if save_path is None:
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        save_path = f"./log/json_state/state_{timestamp}.json"
+        # Use task_id from state if available, otherwise generate timestamp
+        task_id = state.get("task_id")
+        if task_id:
+            save_path = f"./log/json_state/state_{task_id}.json"
+        else:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            save_path = f"./log/json_state/state_{timestamp}.json"
 
     output_path = Path(save_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)

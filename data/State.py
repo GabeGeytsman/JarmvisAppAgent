@@ -45,6 +45,7 @@ class State(TypedDict):
     tool_results: List[
         Dict
     ]  # Results of tool calls (e.g., returns from OCR, API calls, etc.)
+    square_coords: Optional[Dict]  # Mapping of grid square numbers to (x, y) coordinates
 
     # Device related
     device: str  # Device name or ID (kept for backwards compatibility)
@@ -69,9 +70,15 @@ class DeploymentState(TypedDict):
     State machine for task deployment execution
     """
 
+    # Task identification and logging (matching exploration mode)
+    task_id: str  # Unique task identifier (timestamp-based)
+    app_name: str  # Inferred application name
+    save_screenshots: bool  # Whether to retain screenshots after task completion
+
     # Task related
     task: str  # User input task description
     completed: bool  # Whether the task is completed
+    agent_signals_complete: bool  # Whether the action agent believes task is complete
     current_step: int  # Current execution step index
     total_steps: int  # Total number of steps
     execution_status: str  # Execution status (ready/running/success/error)
@@ -101,6 +108,7 @@ class DeploymentState(TypedDict):
     # Execution flow control
     should_fallback: bool  # Whether to fall back to basic operation mode
     should_execute_shortcut: bool  # Whether to execute shortcut operations
+    in_react_mode: bool  # Whether we're in React/fallback mode loop
 
     # Callback
     callback: Optional[Callable[[TypedDict], None]]  # Callback function
@@ -112,6 +120,9 @@ def create_deployment_state(
     max_retries: int = 3,
     callback: Optional[Callable[[TypedDict], None]] = None,
     controller: Optional[DeviceController] = None,
+    task_id: Optional[str] = None,
+    app_name: Optional[str] = None,
+    save_screenshots: bool = True,
 ) -> DeploymentState:
     """
     Create and initialize DeploymentState object
@@ -122,17 +133,28 @@ def create_deployment_state(
         max_retries: Maximum retry count, default is 3
         callback: Callback function (optional)
         controller: DeviceController instance (optional)
+        task_id: Unique task identifier (optional, auto-generated if not provided)
+        app_name: Inferred application name (optional)
+        save_screenshots: Whether to retain screenshots after task completion
 
     Returns:
         Initialized DeploymentState object
     """
+    from datetime import datetime
+
     # Basic default values
     state: Dict[str, Any] = {}
+
+    # Task identification and logging (matching exploration mode)
+    state["task_id"] = task_id or datetime.now().strftime("%Y%m%d_%H%M%S")
+    state["app_name"] = app_name or ""
+    state["save_screenshots"] = save_screenshots
 
     # Initialize all fields, ensure all fields have default values
     # Task related
     state["task"] = task
     state["completed"] = False
+    state["agent_signals_complete"] = False
     state["current_step"] = 0
     state["total_steps"] = 0
     state["execution_status"] = "ready"
@@ -164,6 +186,7 @@ def create_deployment_state(
     # Execution flow control
     state["should_fallback"] = False
     state["should_execute_shortcut"] = False
+    state["in_react_mode"] = False
 
     # Callback
     state["callback"] = callback
