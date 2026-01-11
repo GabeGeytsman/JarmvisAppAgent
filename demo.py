@@ -878,17 +878,18 @@ with gr.Blocks(
 
                 with gr.Row():
                     refresh_btn = gr.Button(
-                        "1. Refresh File List", variant="secondary", scale=1
+                        "Refresh File List", variant="secondary", scale=1
                     )
-                    store_to_db_btn = gr.Button(
-                        "2. Store Record to Database", variant="primary", scale=1
+                    process_all_btn = gr.Button(
+                        "Process & Store to Knowledge Graph", variant="primary", scale=2
                     )
-                    understand_btn = gr.Button(
-                        "3. Understand Operation Path", variant="primary", scale=1
-                    )
-                    generate_btn = gr.Button(
-                        "4. Generate Advanced Path", variant="primary", scale=1
-                    )
+
+                gr.Markdown("""
+                **Process & Store** does the following in sequence:
+                1. Stores pages and elements to Neo4j graph database
+                2. Stores page embeddings to Pinecone for visual similarity matching
+                3. Analyzes action chains and generates high-level shortcuts (if applicable)
+                """)
 
             # Store file list global variable
             current_files = []
@@ -1028,13 +1029,21 @@ with gr.Blocks(
             )
 
             # Define function to store to database
-            def store_to_database(selected_file):
+            def process_and_store_all(selected_file, progress=gr.Progress()):
+                """Combined function that stores to DB, analyzes chain with LLM, and generates shortcuts."""
                 global current_files, current_task_id
 
                 if not selected_file:
-                    return "Error: Please select a file first"
+                    yield "Error: Please select a file first"
+                    return
 
-                # Find corresponding file information based on selected text
+                logs = []
+
+                def add_log(msg):
+                    logs.append(msg)
+                    return "\n".join(logs)
+
+                # Find corresponding file information
                 file_path = None
                 for file in current_files:
                     if format_file_choice(file) == selected_file:
@@ -1042,26 +1051,346 @@ with gr.Blocks(
                         break
 
                 if not file_path:
-                    return "Error: Failed to retrieve selected file path"
+                    yield "Error: Failed to retrieve selected file path"
+                    return
+
+                # ================================================================
+                # STEP 0: Show State JSON Contents
+                # ================================================================
+                yield add_log("=" * 60)
+                yield add_log("📄 STATE JSON CONTENTS")
+                yield add_log("=" * 60)
+                yield add_log(f"  File: {selected_file}")
+                yield add_log(f"  Path: {file_path}")
+                yield add_log("")
 
                 try:
-                    # Call json2db function and get task ID
-                    task_id = json2db(file_path)
-                    current_task_id = task_id  # Ensure update global variable
+                    with open(file_path, "r", encoding="utf-8") as f:
+                        state_data = json.load(f)
 
-                    return f"File {selected_file} successfully stored to database!\nTask ID: {task_id}\nThis ID will be used for subsequent operation path understanding."
+                    # Show task description
+                    task_desc = state_data.get("tsk", "NOT FOUND")
+                    yield add_log(f"  📋 Task: {task_desc}")
+
+                    # Show app name
+                    app_name = state_data.get("app_name", "NOT FOUND")
+                    yield add_log(f"  📱 App: {app_name}")
+
+                    # Show step count
+                    history = state_data.get("history_steps", [])
+                    yield add_log(f"  📊 Steps: {len(history)}")
+
+                    # Show each step summary
+                    if history:
+                        yield add_log("")
+                        yield add_log("  Action History:")
+                        for i, step in enumerate(history):
+                            step_num = step.get("step", i)
+                            tool_result = step.get("tool_result", {})
+                            action = tool_result.get("action", "unknown")
+                            status = tool_result.get("status", "unknown")
+                            square = tool_result.get("square")
+                            recommended_action = step.get("recommended_action", "")
+
+                            # Infer action type for legacy "react_mode" entries
+                            if action == "react_mode":
+                                if square is not None:
+                                    action = "tap"  # Had a square = tap action
+                                elif tool_result.get("input_str"):
+                                    action = "text"
+                                elif "enter" in recommended_action.lower() or "submit" in recommended_action.lower():
+                                    action = "enter"
+
+                            # Format display based on action type
+                            if action == "tap" and square:
+                                # Extract brief summary from recommended_action
+                                brief = ""
+                                if recommended_action:
+                                    # Get first sentence or up to 50 chars
+                                    first_sentence = recommended_action.split('.')[0][:50]
+                                    brief = f" - {first_sentence}"
+                                yield add_log(f"    Step {step_num}: tap square {square}{brief}")
+                            elif action == "text":
+                                text = tool_result.get("input_str", "?")[:30]
+                                yield add_log(f"    Step {step_num}: text \"{text}\"")
+                            elif action == "enter":
+                                yield add_log(f"    Step {step_num}: enter key (submit)")
+                            elif action == "task_completion_check":
+                                yield add_log(f"    Step {step_num}: ✓ task complete")
+                            elif action == "no_action" or status == "no_action":
+                                yield add_log(f"    Step {step_num}: (no action - awaiting judgment)")
+                            else:
+                                yield add_log(f"    Step {step_num}: {action} ({status})")
+
+                    # Show final page info
+                    final_page = state_data.get("final_page", {})
+                    if final_page:
+                        yield add_log("")
+                        yield add_log(f"  🏁 Final Screenshot: {final_page.get('screenshot', 'None')}")
+
+                    yield add_log("")
+
                 except Exception as e:
+                    yield add_log(f"  ⚠️ Could not parse state JSON: {str(e)}")
+                    yield add_log("")
+
+                # ================================================================
+                # STEP 1: Store to Neo4j & Pinecone
+                # ================================================================
+                yield add_log("=" * 60)
+                yield add_log("📦 STEP 1/4: Storing to Neo4j & Pinecone")
+                yield add_log("=" * 60)
+                progress(0.05, "Storing to database...")
+
+                try:
+                    yield add_log("  → Processing state JSON and storing to databases...")
+                    yield add_log("")
+
+                    # Capture json2db output
+                    import io
+                    import sys
+                    captured_output = io.StringIO()
+                    old_stdout = sys.stdout
+                    sys.stdout = captured_output
+
+                    try:
+                        task_id = json2db(file_path, verbose=True)
+                    finally:
+                        sys.stdout = old_stdout
+
+                    # Display captured output
+                    output = captured_output.getvalue()
+                    for line in output.splitlines():
+                        if line.strip():
+                            yield add_log(f"  {line}")
+
+                    current_task_id = task_id
+
+                    yield add_log("")
+                    yield add_log(f"✓ Storage complete!")
+                    yield add_log(f"  Task ID: {task_id}")
+                except Exception as e:
+                    yield add_log(f"❌ Error storing to database: {str(e)}")
                     import traceback
+                    yield add_log(traceback.format_exc())
+                    return
 
-                    return (
-                        f"Error storing to database: {str(e)}\n{traceback.format_exc()}"
-                    )
+                # ================================================================
+                # STEP 2: Get chain start node
+                # ================================================================
+                yield add_log("")
+                yield add_log("=" * 60)
+                yield add_log("🔍 STEP 2/4: Finding Chain Start Node")
+                yield add_log("=" * 60)
+                progress(0.15, "Finding start node...")
 
-            # Bind store to database button event
-            store_to_db_btn.click(
-                fn=store_to_database,
+                try:
+                    db = Neo4jDatabase(uri=config.Neo4j_URI, auth=config.Neo4j_AUTH)
+
+                    yield add_log("  → Querying Neo4j for chain start nodes...")
+                    start_nodes = db.get_chain_start_nodes()
+
+                    if not start_nodes:
+                        yield add_log("❌ No start nodes found in database")
+                        yield add_log("  The chain may not have been stored correctly.")
+                        return
+
+                    yield add_log(f"  → Found {len(start_nodes)} start node(s)")
+
+                    # Find the start node matching our task ID
+                    matching_node = None
+                    for idx, node in enumerate(start_nodes):
+                        try:
+                            if "other_info" in node:
+                                other_info = node["other_info"]
+                                if isinstance(other_info, str):
+                                    other_info = json.loads(other_info)
+
+                                if "task_info" in other_info and "task_id" in other_info["task_info"]:
+                                    node_task_id = other_info["task_info"]["task_id"]
+                                    yield add_log(f"  → Node {idx+1}: task_id={node_task_id}")
+
+                                    if node_task_id == current_task_id:
+                                        matching_node = node
+                                        yield add_log(f"  ✓ Found matching node!")
+                                        break
+                        except Exception as e:
+                            yield add_log(f"  → Error parsing node {idx+1}: {str(e)}")
+
+                    if not matching_node:
+                        # Fall back to most recent node
+                        matching_node = start_nodes[-1]
+                        yield add_log(f"  → No exact match, using most recent node")
+
+                    start_page_id = matching_node["page_id"]
+                    yield add_log(f"✓ Using start page: {start_page_id[:16]}...")
+
+                except Exception as e:
+                    yield add_log(f"❌ Error finding start node: {str(e)}")
+                    import traceback
+                    yield add_log(traceback.format_exc())
+                    return
+
+                # ================================================================
+                # STEP 3: LLM Chain Understanding
+                # ================================================================
+                yield add_log("")
+                yield add_log("=" * 60)
+                yield add_log("🧠 STEP 3/4: LLM Chain Analysis")
+                yield add_log("=" * 60)
+                yield add_log("  This step uses Claude to understand the action chain...")
+                progress(0.25, "LLM analyzing chain...")
+
+                import asyncio
+                import io
+                import sys
+                from contextlib import redirect_stdout
+
+                # Create async wrapper for LLM chain processing
+                processed_triplets = []
+
+                async def run_chain_understanding():
+                    nonlocal processed_triplets
+                    try:
+                        processed_triplets = await process_and_update_chain(start_page_id)
+                    except Exception as e:
+                        raise e
+
+                try:
+                    yield add_log("  → Extracting chain triplets from Neo4j...")
+                    yield add_log("  → Sending to Claude for reasoning analysis...")
+                    yield add_log("  → (This may take 30-60 seconds)")
+
+                    # Run async function
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+
+                    # Capture stdout from the chain processing
+                    f = io.StringIO()
+                    with redirect_stdout(f):
+                        loop.run_until_complete(run_chain_understanding())
+
+                    # Add captured output to logs
+                    output = f.getvalue()
+                    for line in output.splitlines():
+                        if line.strip():
+                            yield add_log(f"  {line}")
+
+                    if processed_triplets:
+                        yield add_log(f"✓ Chain analysis complete!")
+                        yield add_log(f"  Processed {len(processed_triplets)} triplets")
+
+                        # Show sample of what was analyzed
+                        for i, triplet in enumerate(processed_triplets[:3]):
+                            if isinstance(triplet, dict):
+                                # Get action description - handle nested dict structure
+                                action_data = triplet.get('action', {})
+                                if isinstance(action_data, dict):
+                                    action = action_data.get('action_name', 'Unknown')
+                                else:
+                                    action = triplet.get('action_description', 'Unknown')
+                                action = str(action) if action else 'Unknown'
+                                yield add_log(f"  Step {i+1}: {action[:60]}...")
+                    else:
+                        yield add_log("⚠️ No triplets processed (chain may be empty)")
+
+                except Exception as e:
+                    yield add_log(f"⚠️ Chain understanding error: {str(e)}")
+                    yield add_log("  Continuing to evolution step anyway...")
+
+                progress(0.6, "Chain analysis complete")
+
+                # ================================================================
+                # STEP 4: LLM Chain Evolution (Create Shortcuts)
+                # ================================================================
+                yield add_log("")
+                yield add_log("=" * 60)
+                yield add_log("⚡ STEP 4/4: LLM Chain Evolution")
+                yield add_log("=" * 60)
+                yield add_log("  This step evaluates if the chain can become a reusable shortcut...")
+                progress(0.7, "LLM evaluating templateability...")
+
+                action_id = None
+
+                async def run_chain_evolution():
+                    nonlocal action_id
+                    try:
+                        action_id = await evolve_chain_to_action(start_page_id)
+                    except Exception as e:
+                        raise e
+
+                try:
+                    yield add_log("  → Evaluating chain templateability...")
+                    yield add_log("  → Asking Claude: 'Can this be a reusable action?'")
+                    yield add_log("  → (This may take 30-60 seconds)")
+
+                    # Capture stdout
+                    f = io.StringIO()
+                    with redirect_stdout(f):
+                        loop.run_until_complete(run_chain_evolution())
+
+                    # Add captured output to logs
+                    output = f.getvalue()
+                    for line in output.splitlines():
+                        if line.strip():
+                            yield add_log(f"  {line}")
+
+                    if action_id:
+                        yield add_log(f"✓ High-level action created!")
+                        yield add_log(f"  Action ID: {action_id}")
+                        yield add_log(f"  This action can now be reused for similar tasks.")
+                    else:
+                        yield add_log("ℹ️ Chain evaluated as NOT templatable")
+                        yield add_log("  (Single-use action, not suitable for shortcut)")
+
+                except Exception as e:
+                    yield add_log(f"⚠️ Chain evolution error: {str(e)}")
+                    import traceback
+                    yield add_log(traceback.format_exc())
+
+                finally:
+                    loop.close()
+
+                # ================================================================
+                # SUMMARY
+                # ================================================================
+                yield add_log("")
+                yield add_log("=" * 60)
+                yield add_log("📊 PROCESSING SUMMARY")
+                yield add_log("=" * 60)
+                progress(0.95, "Generating summary...")
+
+                try:
+                    with db.driver.session() as session:
+                        page_count = session.run("MATCH (p:Page) RETURN count(p) as count").single()["count"]
+                        element_count = session.run("MATCH (e:Element) RETURN count(e) as count").single()["count"]
+                        action_count = session.run("MATCH (a:Action) RETURN count(a) as count").single()["count"]
+                        relationship_count = session.run("MATCH ()-[r]->() RETURN count(r) as count").single()["count"]
+
+                    yield add_log(f"  📄 Total Pages: {page_count}")
+                    yield add_log(f"  🔘 Total Elements: {element_count}")
+                    yield add_log(f"  ⚡ Total High-Level Actions: {action_count}")
+                    yield add_log(f"  🔗 Total Relationships: {relationship_count}")
+                except Exception as e:
+                    yield add_log(f"  (Could not get summary: {str(e)})")
+
+                yield add_log("")
+                yield add_log("=" * 60)
+                yield add_log("✅ ALL PROCESSING COMPLETE!")
+                yield add_log("=" * 60)
+                yield add_log("")
+                yield add_log("Next steps:")
+                yield add_log("  1. View the graph in Neo4j Browser (http://localhost:7474)")
+                yield add_log("  2. Run similar tasks in 'Action Execution' tab")
+                yield add_log("  3. The system will try to match & replay learned actions")
+                progress(1.0, "Done!")
+
+            # Bind process all button event
+            process_all_btn.click(
+                fn=process_and_store_all,
                 inputs=[json_files],
                 outputs=[evolution_log],
+                show_progress="hidden",
             )
 
             # Button click event
@@ -1310,14 +1639,10 @@ with gr.Blocks(
                     add_log(traceback.format_exc())
                     yield "\n".join(current_log)
 
-            understand_btn.click(
-                fn=understand_chain,
-                inputs=[json_files],
-                outputs=[evolution_log],
-                queue=True,  # Enable queue processing
-            )
+            # Note: understand_chain function kept for potential future use
+            # but not bound to any button (functionality merged into process_and_store_all)
 
-            # Define function to generate advanced path
+            # Define function to generate advanced path (kept for potential future use)
             def generate_high_level_action(selected_file, progress=gr.Progress()):
                 global current_files, current_task_id
 
@@ -1520,13 +1845,8 @@ with gr.Blocks(
                     add_log(traceback.format_exc())
                     yield "\n".join(current_log)
 
-            # Modify generate advanced path button binding
-            generate_btn.click(
-                fn=generate_high_level_action,
-                inputs=[json_files],
-                outputs=[evolution_log],
-                queue=True,  # Enable queue processing
-            )
+            # Note: generate_high_level_action function kept for potential future use
+            # but not bound to any button (functionality merged into process_and_store_all)
 
         # Tab 5: Action Execution
         with gr.Tab("Action Execution"):
@@ -1548,6 +1868,12 @@ with gr.Blocks(
                         label="Enter Task Description",
                         placeholder="e.g., Open settings and switch to airplane mode",
                         lines=3,
+                    )
+
+                    save_screenshots_exec = gr.Checkbox(
+                        label="Save screenshots after task completion",
+                        value=True,
+                        info="Uncheck to delete screenshots when task finishes (saves disk space)"
                     )
 
                     # Execution control
@@ -1590,13 +1916,20 @@ with gr.Blocks(
 
             # Execute task function
             def execute_deployment_task(
-                device, task_description, progress=gr.Progress()
+                device, task_description, save_screenshots=True, progress=gr.Progress()
             ):
+                # Button states: (execute_btn, stop_btn)
+                # During execution: execute disabled, stop enabled
+                # After execution: execute enabled, stop disabled
+                buttons_executing = (gr.update(interactive=False), gr.update(interactive=True))
+                buttons_idle = (gr.update(interactive=True), gr.update(interactive=False))
+
                 if not device or device == "No devices found":
                     yield (
                         "Error: Please select a valid device",
                         "Execution failed: No valid device selected",
                         [],
+                        *buttons_idle,  # Re-enable execute button
                     )
                     return
 
@@ -1605,6 +1938,7 @@ with gr.Blocks(
                         "Error: Please enter task description",
                         "Execution failed: Task description is empty",
                         [],
+                        *buttons_idle,  # Re-enable execute button
                     )
                     return
 
@@ -1688,6 +2022,27 @@ with gr.Blocks(
                             if screenshot_path and screenshot_path not in screenshots:
                                 screenshots.append(screenshot_path)
 
+                        elif node_name == "visual_similarity_search":
+                            status = info.get("status", "")
+                            message = info.get("message", "")
+
+                            if status == "started":
+                                logs.append("")
+                                logs.append("=" * 50)
+                                logs.append(f"🔍 STEP {step_num}: Knowledge Graph Lookup")
+                                logs.append("-" * 30)
+                                logs.append(message)
+                            elif status == "found":
+                                logs.append(message)
+                                logs.append(f"   📋 Matched task: {info.get('matched_task', '?')}")
+                                logs.append(f"   📍 Matched step: {info.get('matched_step', '?')}")
+                            elif status == "not_found":
+                                logs.append(message)
+                            elif status == "no_action":
+                                logs.append(message)
+                            elif status == "error":
+                                logs.append(message)
+
                         elif node_name == "fallback":
                             logs.append("")
                             logs.append("=" * 50)
@@ -1695,6 +2050,41 @@ with gr.Blocks(
                             logs.append("-" * 30)
                             if info.get("message"):
                                 logs.append(info["message"])
+
+                            screenshot_path = info.get("screenshot_path")
+                            if screenshot_path and screenshot_path not in screenshots:
+                                screenshots.append(screenshot_path)
+
+                        elif node_name == "task_judgment":
+                            logs.append("")
+                            logs.append("=" * 50)
+                            logs.append(f"⚖️ STEP {step_num}: Task Completion Check")
+                            logs.append("-" * 30)
+
+                            # Show completion criteria
+                            criteria = info.get("completion_criteria", "")
+                            if criteria:
+                                logs.append("📋 COMPLETION CRITERIA:")
+                                for line in criteria.split('\n')[:5]:
+                                    if line.strip():
+                                        logs.append(f"   {line.strip()}")
+                                logs.append("")
+
+                            # Show judge reasoning
+                            judge_reasoning = info.get("judge_reasoning", "")
+                            if judge_reasoning:
+                                logs.append("🧠 JUDGE LLM ANALYSIS:")
+                                for line in judge_reasoning.split('\n'):
+                                    if line.strip():
+                                        logs.append(f"   {line.strip()}")
+                                logs.append("")
+
+                            # Show verdict prominently
+                            verdict = info.get("verdict", "UNKNOWN")
+                            if "COMPLETE" in verdict and "NOT" not in verdict:
+                                logs.append(f"✅ VERDICT: {verdict}")
+                            else:
+                                logs.append(f"❌ VERDICT: {verdict}")
 
                             screenshot_path = info.get("screenshot_path")
                             if screenshot_path and screenshot_path not in screenshots:
@@ -1725,7 +2115,8 @@ with gr.Blocks(
                             result = deployment_run_task(
                                 task_description,
                                 device,
-                                callback=execution_callback
+                                callback=execution_callback,
+                                save_screenshots=save_screenshots
                             )
 
                             # Put final result in queue
@@ -1756,19 +2147,19 @@ with gr.Blocks(
                                 step_count += 1
                                 progress_val = min(0.1 + step_count * 0.05, 0.9)
                                 progress(progress_val, "Executing task...")
-                                yield log_text, "Executing...", screenshot_list
+                                yield log_text, "Executing...", screenshot_list, *buttons_executing
                         except:
                             pass
 
                         time.sleep(0.3)
                         # Yield current state even if no updates
-                        yield "\n".join(logs), "Executing...", list(screenshots)
+                        yield "\n".join(logs), "Executing...", list(screenshots), *buttons_executing
 
                     # Process any remaining updates
                     while not update_queue.empty():
                         try:
                             update_type, log_text, screenshot_list = update_queue.get_nowait()
-                            yield log_text, "Executing...", screenshot_list
+                            yield log_text, "Executing...", screenshot_list, *buttons_executing
                         except:
                             break
 
@@ -1777,18 +2168,63 @@ with gr.Blocks(
                         result = result_queue.get(timeout=5)
                         status = result.get("status", "unknown")
                         message = result.get("message", "")
+                        task_id = result.get("task_id", "unknown")
+                        app_name = result.get("app_name", "")
 
                         if status == "success" or status == "completed":
-                            final_status = "✅ Execution successful: Task completed"
+                            final_status = f"✅ Task ID: {task_id} | Execution successful"
                             add_log("")
                             add_log("=" * 50)
-                            add_log("✅ Task execution completed!")
+                            add_log(f"✅ Task execution completed!")
+                            add_log(f"📋 Task ID: {task_id}")
+                            add_log(f"📱 App: {app_name}")
+
+                            # Convert DeploymentState to State-compatible format and save JSON
+                            deployment_state = result.get("state", {})
+                            if deployment_state:
+                                # Convert deployment history to exploration history_steps format
+                                deployment_history = deployment_state.get("history", [])
+                                converted_history = []
+                                for h in deployment_history:
+                                    # Preserve full tool_output data for knowledge graph
+                                    tool_output = h.get("tool_output", {}) if isinstance(h.get("tool_output"), dict) else {}
+                                    tool_result = {
+                                        "action": h.get("action", tool_output.get("action", "")),
+                                        "status": h.get("status", tool_output.get("status", "")),
+                                        **tool_output,  # Include all fields from tool_output (square, clicked_element, input_str, etc.)
+                                    }
+                                    converted_step = {
+                                        "step": h.get("step", 0),
+                                        "source_page": h.get("screenshot", h.get("gridded_screenshot", "")),
+                                        "source_json": h.get("elements_json"),
+                                        "recommended_action": h.get("recommended_action", h.get("action_details", "")),
+                                        "tool_result": tool_result,
+                                        "timestamp": datetime.datetime.now().isoformat(),
+                                    }
+                                    converted_history.append(converted_step)
+
+                                # Build state compatible with state2json
+                                state_for_json = {
+                                    "task_id": task_id,
+                                    "tsk": deployment_state.get("task", task_description),
+                                    "app_name": app_name,
+                                    "step": deployment_state.get("current_step", 0),
+                                    "history_steps": converted_history,
+                                    "current_page_screenshot": deployment_state.get("current_page", {}).get("screenshot", ""),
+                                    "current_page_json": deployment_state.get("current_page", {}).get("elements_json", ""),
+                                    "save_screenshots": save_screenshots,
+                                }
+                                try:
+                                    state_json_result = state2json(state_for_json)
+                                    add_log(f"💾 {state_json_result}")
+                                except Exception as e:
+                                    add_log(f"⚠️ Failed to save state JSON: {str(e)}")
                         elif status == "error":
-                            final_status = f"❌ Execution failed: {message}"
+                            final_status = f"❌ Task ID: {task_id} | Execution failed: {message}"
                             add_log("")
                             add_log(f"❌ Task execution failed: {message}")
                         else:
-                            final_status = f"⚠️ Execution status: {status}"
+                            final_status = f"⚠️ Task ID: {task_id} | Status: {status}"
                             add_log(f"⚠️ Final status: {status}")
                     except:
                         final_status = "❓ Unable to retrieve execution result"
@@ -1797,37 +2233,31 @@ with gr.Blocks(
                     progress(1.0, "Execution completed")
                     add_log("Task execution process completed")
 
-                    yield "\n".join(logs), final_status, list(screenshots)
+                    yield "\n".join(logs), final_status, list(screenshots), *buttons_idle
 
                 except Exception as e:
                     import traceback
                     error_message = f"Error during execution: {str(e)}\n{traceback.format_exc()}"
                     add_log(error_message)
-                    yield "\n".join(logs), f"Execution error: {str(e)}", list(screenshots)
+                    yield "\n".join(logs), f"Execution error: {str(e)}", list(screenshots), *buttons_idle
 
             # Handle task execution button click
+            # Outputs include button states: execute_btn and stop_btn
+            # show_progress="hidden" disables the loading spinner overlay
             execute_btn.click(
                 fn=execute_deployment_task,
-                inputs=[device_selector_exec, task_input],
-                outputs=[execution_log, execution_status, screenshot_gallery_exec],
+                inputs=[device_selector_exec, task_input, save_screenshots_exec],
+                outputs=[execution_log, execution_status, screenshot_gallery_exec, execute_btn, stop_btn],
                 queue=True,
+                show_progress="hidden",
             )
 
-            # Stop execution feature can be implemented in future version
-            # Currently only set basic UI structure
-            def toggle_execution_buttons(executing=True):
-                if executing:
-                    return gr.update(interactive=False), gr.update(interactive=True)
-                else:
-                    return gr.update(interactive=True), gr.update(interactive=False)
-
-            execute_btn.click(
-                fn=lambda: toggle_execution_buttons(True),
-                outputs=[execute_btn, stop_btn],
-            )
+            # Stop button resets the button states (actual stop functionality can be added later)
+            def reset_buttons():
+                return gr.update(interactive=True), gr.update(interactive=False)
 
             stop_btn.click(
-                fn=lambda: toggle_execution_buttons(False),
+                fn=reset_buttons,
                 outputs=[execute_btn, stop_btn],
             )
 

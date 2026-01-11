@@ -1,4 +1,5 @@
 import time
+import logging
 from typing import Any, Optional, Tuple
 
 from langchain_core.prompts import ChatPromptTemplate
@@ -14,7 +15,13 @@ from data.vector_db import VectorStore
 from tool.img_tool import *
 from tool.screen_content import *
 from device import ADBController
-from tool.screen_content import set_controller
+from tool.screen_content import set_controller, set_square_coords
+
+# Import grid functions from exploration module
+from explor_auto import add_coordinate_grid, get_dominant_color, get_complement_color
+
+# Setup logging
+logger = logging.getLogger(__name__)
 
 os.environ["LANGCHAIN_TRACING_V2"] = config.LANGCHAIN_TRACING_V2
 os.environ["LANGCHAIN_ENDPOINT"] = config.LANGCHAIN_ENDPOINT
@@ -59,9 +66,32 @@ model = ChatAnthropic(
 
 URI = config.Neo4j_URI
 AUTH = config.Neo4j_AUTH
-db = Neo4jDatabase(URI, AUTH)
 
-vector_db = VectorStore(api_key=config.PINECONE_API_KEY)
+# Initialize databases lazily to avoid import-time failures
+db = None
+vector_db = None
+
+def get_db():
+    """Get Neo4j database connection (lazy initialization)."""
+    global db
+    if db is None:
+        try:
+            db = Neo4jDatabase(URI, AUTH)
+        except Exception as e:
+            logger.warning(f"Failed to connect to Neo4j: {e}")
+            return None
+    return db
+
+def get_vector_db():
+    """Get vector database connection (lazy initialization)."""
+    global vector_db
+    if vector_db is None:
+        try:
+            vector_db = VectorStore(api_key=config.PINECONE_API_KEY)
+        except Exception as e:
+            logger.warning(f"Failed to connect to Pinecone: {e}")
+            return None
+    return vector_db
 
 
 def create_execution_state(device: str) -> Dict[str, Any]:
@@ -100,7 +130,11 @@ def match_task_to_action(
     print(f"Matching task: {task}")
 
     # 1. Get all high-level action nodes from database
-    high_level_actions = db.get_all_high_level_actions()
+    neo4j_db = get_db()
+    if not neo4j_db:
+        print("❌ Neo4j not available, cannot match task to action")
+        return False, None
+    high_level_actions = neo4j_db.get_all_high_level_actions()
 
     if not high_level_actions:
         print("❌ No high-level action nodes found")
@@ -179,13 +213,14 @@ If no match is found, return "NO_MATCH" with a brief explanation.
 
 def capture_and_parse_screen(state: DeploymentState) -> DeploymentState:
     """
-    Capture current screen and parse elements, update state
+    Capture current screen and create numbered grid overlay (no OmniParser).
+    Uses the same grid-based system as the exploration phase.
 
     Args:
         state: Deployment state
 
     Returns:
-        Updated deployment state
+        Updated deployment state with gridded screenshot and square coordinates
     """
     import time
 
@@ -216,62 +251,53 @@ def capture_and_parse_screen(state: DeploymentState) -> DeploymentState:
             print("❌ Screenshot failed")
             return state
 
-        # IMPORTANT: Set screenshot path immediately after capture
-        # This ensures fallback_to_react won't try to recapture if OmniParser fails
+        # Set screenshot path
         state["current_page"]["screenshot"] = screenshot_path
 
-        # Log: Screenshot captured, starting OmniParser
+        # Log: Screenshot captured, creating grid overlay
         if callback:
             callback(state, "screenshot_captured", {
                 "step": step_num,
-                "message": f"📸 Step {step_num}: Screenshot captured in {screenshot_elapsed:.1f}s. Sending to OmniParser...",
+                "message": f"📸 Step {step_num}: Screenshot captured in {screenshot_elapsed:.1f}s. Creating grid overlay...",
                 "screenshot_path": screenshot_path,
             })
 
-        # 2. Parse screen elements
-        omni_start = time.time()
-        screen_result = screen_element.invoke({"image_path": screenshot_path})
-        omni_elapsed = time.time() - omni_start
+        # 2. Create numbered grid overlay (same as exploration phase)
+        grid_start = time.time()
+        gridded_screenshot_path, square_coords = add_coordinate_grid(screenshot_path)
+        grid_elapsed = time.time() - grid_start
 
-        if "error" in screen_result:
-            print(f"❌ Screen element parsing failed: {screen_result['error']}")
-            # Set empty elements data so fallback_to_react can at least try with just screenshot
-            state["current_page"]["elements_json"] = None
-            state["current_page"]["elements_data"] = []
-            return state
+        # Store gridded screenshot and coordinates in state
+        state["current_page"]["gridded_screenshot"] = gridded_screenshot_path
+        state["current_page"]["square_coords"] = square_coords
+        state["current_page"]["elements_json"] = None  # No OmniParser JSON
+        state["current_page"]["elements_data"] = []  # No element data
 
-        # 3. Update current page information (screenshot already set above)
-        state["current_page"]["elements_json"] = screen_result[
-            "parsed_content_json_path"
-        ]
+        # Update module-level square coords for screen_action tool
+        set_square_coords(square_coords)
 
-        # 4. Load element data
-        with open(
-            screen_result["parsed_content_json_path"], "r", encoding="utf-8"
-        ) as f:
-            state["current_page"]["elements_data"] = json.load(f)
-
-        elements_count = len(state["current_page"]["elements_data"])
         print(
-            f"✓ Step {step_num}: Screen captured ({screenshot_elapsed:.1f}s) and parsed ({omni_elapsed:.1f}s), detected {elements_count} UI elements"
+            f"✓ Step {step_num}: Screen captured ({screenshot_elapsed:.1f}s) and grid created ({grid_elapsed:.1f}s) with {len(square_coords)} squares"
         )
 
         # Log: Screen analysis complete
         if callback:
             callback(state, "screen_parsed", {
                 "step": step_num,
-                "message": f"📷 Step {step_num}: Screen analysis complete (Screenshot: {screenshot_elapsed:.1f}s, OmniParser: {omni_elapsed:.1f}s)",
+                "message": f"📷 Step {step_num}: Grid overlay created ({len(square_coords)} squares)",
                 "screenshot_path": screenshot_path,
-                "labeled_image_path": screen_result.get("labeled_image_path"),
-                "elements_count": elements_count,
+                "labeled_image_path": gridded_screenshot_path,
+                "elements_count": len(square_coords),
                 "screenshot_time": screenshot_elapsed,
-                "omniparser_time": omni_elapsed,
+                "grid_time": grid_elapsed,
             })
 
         return state
 
     except Exception as e:
         print(f"❌ Error capturing and parsing screen: {str(e)}")
+        import traceback
+        traceback.print_exc()
         return state
 
 
@@ -307,11 +333,15 @@ def match_screen_elements(
         return []
 
     # Get template element from database - using correct method name
-    db_element = db.get_action_by_id(element_id)
+    neo4j_db = get_db()
+    if not neo4j_db:
+        print("⚠️ Neo4j not available, falling back to semantic matching")
+        return fallback_to_semantic_match(state, action_sequence)
+    db_element = neo4j_db.get_action_by_id(element_id)
     if not db_element:
         print(f"⚠️ Element with ID {element_id} not found")
         # Try to get from another type
-        db_element = db.get_element_by_id(element_id)
+        db_element = neo4j_db.get_element_by_id(element_id)
         if not db_element:
             print(f"⚠️ Action with ID {element_id} also not found")
             return []
@@ -454,11 +484,14 @@ def fallback_to_semantic_match(
         return []
 
     # Get element information from database - using correct method name
-    db_element = db.get_action_by_id(element_id)
+    neo4j_db = get_db()
+    if not neo4j_db:
+        return []
+    db_element = neo4j_db.get_action_by_id(element_id)
     if not db_element:
         print(f"⚠️ Element with ID {element_id} not found")
         # Try to get from another type
-        db_element = db.get_element_by_id(element_id)
+        db_element = neo4j_db.get_element_by_id(element_id)
         if not db_element:
             print(f"⚠️ Action with ID {element_id} also not found")
             return []
@@ -686,7 +719,7 @@ def execute_element_action(
 
 def fallback_to_react(state: DeploymentState) -> DeploymentState:
     """
-    Fall back to React mode when template execution fails.
+    Execute using React mode with numbered grid system (same as exploration phase).
     Executes ONE step at a time, relying on the workflow loop for iteration.
 
     Args:
@@ -695,82 +728,39 @@ def fallback_to_react(state: DeploymentState) -> DeploymentState:
     Returns:
         Updated execution state with agent_signals_complete flag if task is done
     """
-    print("🔄 Executing React mode step...")
+    print("🔄 Executing React mode step with grid system...")
     task = state["task"]
     callback = state.get("callback")
 
     # Create action_agent for page operation decisions
-    # Explicitly bind tools to the model to ensure they are passed to the Claude API
     tools = [screen_action, request_completion_check]
     model_with_tools = model.bind_tools(tools)
     action_agent = create_react_agent(model_with_tools, tools)
 
-    # Initialize React mode
-    if not state["messages"]:
-        # Set system prompt with tool-based completion signal
-        system_message = SystemMessage(
-            content="""You are an intelligent smartphone operation assistant who will help users complete tasks on mobile devices.
-You can help users by observing the screen and performing various operations (clicking, typing text, swiping, etc.).
-Analyze the current screen content, determine the best next action, and use the appropriate tools to execute it.
-Each step of the operation should move toward completing the user's goal task.
-
-AVAILABLE TOOLS:
-1. screen_action - Interact with the device using these actions:
-   - "tap": Tap at specific coordinates (requires x, y)
-   - "text": Type text (requires input_str) - NOTE: You must tap a text field first to focus it!
-   - "enter": Press Enter/Search key - USE THIS AFTER TYPING to submit a search query or form
-   - "back": Press the back button
-   - "swipe": Swipe in a direction (requires x, y, direction: "up", "down", "left", or "right")
-   - "long_press": Long press at coordinates (requires x, y)
-
-2. request_completion_check - Call this when you believe the task is FULLY complete and you can SEE the result on screen.
-
-IMPORTANT RULES:
-1. THINK STEP-BY-STEP: Before acting, explain what you see on screen and why you're taking this action.
-2. ONE ACTION AT A TIME: Only perform ONE action per turn.
-3. TAP BEFORE TYPING: You MUST tap on a text input field to focus it BEFORE you can type text into it.
-4. PRESS ENTER AFTER TYPING: After typing a search query or form input, use action="enter" to submit it.
-5. BE PRECISE: Use the element IDs and bounding boxes to calculate exact tap coordinates.
-   - The bbox values are relative (0-1 range). Multiply by screen width/height to get absolute coordinates.
-
-TASK COMPLETION:
-- When the task is complete and you can SEE the final result on screen, call request_completion_check(reason="description of what you see").
-- Do NOT call request_completion_check immediately after an action - wait for the next screenshot first."""
-        )
-
-        state["messages"].append(system_message)
-
-        # Add user task
-        user_message = HumanMessage(
-            content=f"I need to complete the following task on a mobile device: {task}"
-        )
-        state["messages"].append(user_message)
-
-    # Capture current screen (only if not already captured by capture_screen_node)
+    # Capture current screen with grid overlay (if not already captured)
     if not state["current_page"].get("screenshot"):
         state = capture_and_parse_screen(state)
         if not state["current_page"]["screenshot"]:
             state["execution_status"] = "error"
-            print("Unable to capture or parse screen")
+            print("Unable to capture screen")
             return state
 
-        # Notify callback about screen capture in React mode
-        if callback:
-            callback(state, "react_capture", {
-                "step": state.get("current_step", 0),
-                "message": f"📸 React mode: Captured screen",
-                "screenshot_path": state["current_page"]["screenshot"],
-                "elements_count": len(state["current_page"].get("elements_data", [])),
-            })
-
-    # Prepare screen information
+    # Get screen information
     screenshot_path = state["current_page"].get("screenshot")
-    elements_json_path = state["current_page"].get("elements_json")
+    gridded_screenshot_path = state["current_page"].get("gridded_screenshot")
+    square_coords = state["current_page"].get("square_coords", {})
 
-    # Validate we have at least the screenshot (elements are optional - agent can work from image alone)
-    if not screenshot_path:
+    # If no gridded screenshot exists, create one now
+    if not gridded_screenshot_path or not os.path.exists(gridded_screenshot_path):
+        gridded_screenshot_path, square_coords = add_coordinate_grid(screenshot_path)
+        state["current_page"]["gridded_screenshot"] = gridded_screenshot_path
+        state["current_page"]["square_coords"] = square_coords
+        set_square_coords(square_coords)
+
+    # Validate we have the gridded screenshot
+    if not gridded_screenshot_path:
         state["execution_status"] = "error"
-        print("❌ Missing screenshot path")
+        print("❌ Missing gridded screenshot path")
         return state
 
     device = state["device"]
@@ -788,31 +778,26 @@ TASK COMPLETION:
         elif ext == '.webp':
             return 'image/webp'
         else:
-            return 'image/png'  # Default to PNG
+            return 'image/png'
 
-    # Load screenshot as base64
-    with open(screenshot_path, "rb") as f:
+    # Load GRIDDED screenshot as base64 (same as exploration)
+    with open(gridded_screenshot_path, "rb") as f:
         image_data = f.read()
         image_data_base64 = base64.b64encode(image_data).decode("utf-8")
-    image_media_type = get_image_media_type(screenshot_path)
+    image_media_type = get_image_media_type(gridded_screenshot_path)
 
-    # Load element JSON data (use empty list if not available - agent can still work from screenshot)
-    elements_data = []
-    if elements_json_path and os.path.exists(elements_json_path):
-        try:
-            with open(elements_json_path, "r", encoding="utf-8") as f:
-                elements_data = json.load(f)
-        except Exception as e:
-            print(f"⚠️ Could not load elements JSON: {e}, continuing with screenshot only")
-    else:
-        print("⚠️ No elements JSON available, agent will work from screenshot only")
+    # Notify callback about gridded screenshot
+    if callback:
+        callback(state, "gridded_screenshot", {
+            "step": state.get("current_step", 0),
+            "labeled_image_path": gridded_screenshot_path,
+            "message": f"🔲 Step {state.get('current_step', 0)}: Grid overlay ({len(square_coords)} squares)",
+        })
 
-    elements_text = json.dumps(elements_data, ensure_ascii=False, indent=2)
-
-    # Build action history summary so agent knows what it already did
+    # Build action history summary
     action_history_summary = ""
     if state.get("history"):
-        recent_actions = state["history"][-5:]  # Last 5 actions
+        recent_actions = state["history"][-5:]
         action_lines = []
         for h in recent_actions:
             step = h.get("step", "?")
@@ -820,58 +805,52 @@ TASK COMPLETION:
             status = h.get("status", "?")
             action_lines.append(f"  Step {step}: {action_detail} (status: {status})")
         if action_lines:
-            action_history_summary = "\n\nPREVIOUS ACTIONS YOU ALREADY TOOK:\n" + "\n".join(action_lines) + "\n\nDo NOT repeat these actions. Continue with the NEXT logical step."
+            action_history_summary = "\n\nPREVIOUS ACTIONS:\n" + "\n".join(action_lines) + "\n\nContinue with the NEXT logical step."
 
-    # Build fresh messages each iteration with the FULL system prompt
-    # This ensures the agent always has the complete instructions even after [-4:] slicing
+    # Build messages with grid-based system prompt (SAME AS EXPLORATION PHASE)
     messages = [
         SystemMessage(
-            content=f"""You are an intelligent smartphone operation assistant controlling a mobile device.
+            content=f"""You are an AI agent controlling a mobile device. Analyze the screenshot and perform ONE action.
 
-CRITICAL RULES - READ CAREFULLY:
-1. You can ONLY execute ONE action per turn. After your action, you will receive a NEW screenshot showing the result.
-2. You CANNOT see the result of your action until the NEXT turn. Do NOT assume your action succeeded.
-3. NEVER claim you completed multiple steps - you can only do ONE thing, then you must WAIT for the next screenshot.
-4. Do NOT hallucinate or make up results. You have NO knowledge of what happened after your action until you see the next screenshot.
+AVAILABLE TOOLS:
+1. screen_action - Interact with the device. For tap/long_press/swipe: provide the "square" parameter with the grid square number. For text: provide "input_str". For back/enter: no extra params needed.
+2. request_completion_check - Call this when you believe the task is FULLY complete and you can SEE the result
 
-AVAILABLE ACTIONS (choose exactly ONE):
-- "tap": Tap at coordinates (x, y) - use this to click buttons, focus text fields, etc.
-- "text": Type text (input_str) - ONLY use AFTER you have tapped a text field in a PREVIOUS step and confirmed it's focused
-- "enter": Press Enter/Search key - ONLY use AFTER you have typed text in a PREVIOUS step
-- "back": Press back button
-- "swipe": Swipe in direction (x, y, direction: "up"/"down"/"left"/"right")
-- "long_press": Long press at (x, y)
+NUMBERED GRID SYSTEM:
+The screenshot is divided into {len(square_coords)} NUMBERED SQUARES. Each square has a small number label in its top-left corner.
+To interact with an element, simply identify which numbered square contains your target element and provide that square number to screen_action.
+The system will automatically translate the square number to the correct screen coordinates.
 
-WORKFLOW FOR TYPING IN A SEARCH BOX:
-- Step 1: TAP on the search box to focus it → STOP and wait for next screenshot
-- Step 2: (After seeing keyboard appear) TYPE your query → STOP and wait for next screenshot
-- Step 3: (After seeing text entered) Press ENTER to submit → STOP and wait for next screenshot
-- Step 4: (After seeing results) Signal TASK_COMPLETE
+HOW TO USE:
+1. Find the UI element you want to interact with
+2. Identify which NUMBERED SQUARE contains that element (look at the number in the top-left of the square)
+3. Call screen_action with action="tap" and square=<number>
 
-COORDINATE CALCULATION:
-- bbox values are relative (0-1 range). Multiply by screen width/height for absolute coordinates.
-- Example: bbox [0.3, 0.4, 0.7, 0.5] on 1080x1920 screen → center is (540, 864)
+RESPONSE FORMAT:
+<reasoning>
+1. OBSERVATION: Describe what you see on the current screen
+2. ANALYSIS: Based on the task, what needs to happen next?
+3. TARGET: Which UI element? Which square number contains it?
+4. ACTION: What action and square number?
+</reasoning>
 
-TASK COMPLETION:
-- ONLY signal "TASK_COMPLETE: YES" when you can SEE the final result on the CURRENT screenshot.
-- If you just performed an action, you CANNOT know if it succeeded yet. Wait for the next screenshot.
+Then call screen_action with the square number. Example: screen_action(device="...", action="tap", square=75)
 
-Your response format:
-1. Describe what you see on the CURRENT screenshot
-2. State the ONE action you will take and why
-3. Execute that ONE action using the tool
-4. STOP - do not claim success or describe what will happen next"""
+RULES:
+1. Execute exactly ONE tool call per turn
+2. Do not assume actions succeeded - verify in the next screenshot
+3. For tap/long_press/swipe: use the "square" parameter, NOT x/y coordinates
+4. Call request_completion_check only when you can SEE the task is complete"""
         ),
         HumanMessage(
-            content=f"The current device is: {device}, the device screen size is {device_size}. The user's current task intent is: {task}{action_history_summary}"
-        ),
-        HumanMessage(
-            content="Below is the current page's parsed JSON data (where bbox is a relative value, please convert to actual operation position based on screen size):\n"
-            + elements_text
+            content=f"Device: {device}\nScreen size: {device_size}\nTask: {task}{action_history_summary}"
         ),
         HumanMessage(
             content=[
-                {"type": "text", "text": "Below is the screenshot data:"},
+                {
+                    "type": "text",
+                    "text": "Current screenshot with NUMBERED GRID. Each square has a number in its top-left corner. Find your target element and identify which square number contains it:",
+                },
                 {
                     "type": "image_url",
                     "image_url": {"url": f"data:{image_media_type};base64,{image_data_base64}"},
@@ -880,7 +859,7 @@ Your response format:
         ),
     ]
 
-    # Add these messages to state
+    # Add to state messages
     state["messages"].extend(messages)
 
     # Log: LLM is analyzing and deciding action
@@ -906,15 +885,30 @@ Your response format:
         # Extract recommended action from final_message
         recommended_action = extract_text_content(ai_message.content)
 
-        # Extract LLM reasoning (first AI message has reasoning before tool call)
-        # NOTE: We intentionally only show the FIRST AI message (reasoning before action)
-        # The second AI message is often the LLM hallucinating about success before seeing results
+        # Extract LLM reasoning - find the AI message with BOTH content AND tool_calls
+        # After step 0, the first AI message may be stale from previous context
         llm_reasoning = ""
         ai_messages = [msg for msg in final_messages if msg.type == "ai"]
-        if ai_messages:
-            first_ai_msg = ai_messages[0]
-            if hasattr(first_ai_msg, 'content') and first_ai_msg.content:
-                llm_reasoning = extract_text_content(first_ai_msg.content)
+
+        # Find the AI message that has BOTH content AND tool_calls - that's the reasoning message
+        reasoning_msg = None
+        for msg in ai_messages:
+            has_content = hasattr(msg, 'content') and msg.content
+            has_tool_calls = hasattr(msg, 'tool_calls') and msg.tool_calls
+            if has_content and has_tool_calls:
+                reasoning_msg = msg
+                break
+
+        if reasoning_msg:
+            llm_reasoning = extract_text_content(reasoning_msg.content)
+        elif ai_messages:
+            # Fallback: try first AI message with non-empty content containing reasoning
+            for msg in ai_messages:
+                if hasattr(msg, 'content') and msg.content:
+                    content = extract_text_content(msg.content)
+                    if content and '<reasoning>' in content.lower():
+                        llm_reasoning = content
+                        break
 
         # Parse tool messages to check if a tool was actually called
         # Also detect if request_completion_check was called
@@ -941,22 +935,25 @@ Your response format:
         if completion_check_reason:
             state["completion_check_reason"] = completion_check_reason
 
-        # Determine action details for logging
+        # Determine action details for logging (with square numbers)
         action_details = ""
         if tool_output:
             action_type = tool_output.get("action", "unknown")
             if action_type == "tap":
                 coords = tool_output.get("clicked_element", {})
-                action_details = f"🖱️ TAP at ({coords.get('x', '?')}, {coords.get('y', '?')})"
+                square_num = tool_output.get("square", "?")
+                action_details = f"🖱️ TAP square {square_num} → ({coords.get('x', '?')}, {coords.get('y', '?')})"
             elif action_type == "text":
                 text = tool_output.get("input_str", "")
                 action_details = f"⌨️ TYPE: \"{text}\""
             elif action_type == "swipe":
                 direction = tool_output.get("direction", "?")
-                action_details = f"👆 SWIPE {direction}"
+                square_num = tool_output.get("square", "?")
+                action_details = f"👆 SWIPE {direction} from square {square_num}"
             elif action_type == "long_press":
                 coords = tool_output.get("long_press", {})
-                action_details = f"👆 LONG PRESS at ({coords.get('x', '?')}, {coords.get('y', '?')})"
+                square_num = tool_output.get("square", "?")
+                action_details = f"👆 LONG PRESS square {square_num} → ({coords.get('x', '?')}, {coords.get('y', '?')})"
             elif action_type == "back":
                 action_details = "⬅️ BACK button pressed"
             elif action_type == "enter":
@@ -970,12 +967,14 @@ Your response format:
 
         # Update execution status
         state["current_step"] += 1
+        # Use actual action type from tool_output, fallback to "react_mode" if not available
+        actual_action = tool_output.get("action", "react_mode") if tool_output else "no_action"
         state["history"].append(
             {
                 "step": state["current_step"],
                 "screenshot": screenshot_path,
-                "elements_json": elements_json_path,
-                "action": "react_mode",
+                "gridded_screenshot": gridded_screenshot_path,
+                "action": actual_action,
                 "recommended_action": recommended_action,
                 "tool_output": tool_output,
                 "action_details": action_details,
@@ -1009,7 +1008,7 @@ Your response format:
                 "step": state["current_step"],
                 "screenshot": screenshot_path,
                 "elements_json": elements_json_path,
-                "action": "react_mode",
+                "action": "error",
                 "status": "error",
                 "error": error_msg,
             }
@@ -1050,8 +1049,14 @@ def execute_task(
     # Create new state
     state = create_deployment_state(task=task, device=device)
 
-    # Use global db object
-    neo4j_db = neo4j_db or db
+    # Use global db object (lazy initialization)
+    neo4j_db = neo4j_db or get_db()
+
+    # If no database available, go straight to React mode
+    if not neo4j_db:
+        print("⚠️ Neo4j not available, using React mode directly")
+        state = fallback_to_react(state)
+        return {"status": state["execution_status"], "state": state}
 
     # Query database for all element nodes - using correct method name
     all_elements = neo4j_db.get_all_actions()
@@ -1108,11 +1113,19 @@ def execute_task(
                         state = fallback_to_react(state)
                         return {"status": state["execution_status"], "state": state}
         else:
-            # No shortcuts, try executing basic operation sequence
+            # No shortcuts found, try executing element_sequence directly from high-level action
+            print("ℹ️ No Shortcut nodes found, attempting to use element_sequence from Action...")
             for action in high_level_actions:
-                action_sequence = action.get("action_sequence", [])
+                # Try element_sequence (from chain evolution) or action_sequence (legacy)
+                action_sequence = action.get("element_sequence", action.get("action_sequence", []))
+                action_name = action.get("name", "Unknown action")
+
                 if not action_sequence:
+                    print(f"  → '{action_name}' has no element_sequence, skipping")
                     continue
+
+                print(f"  → Found element_sequence in '{action_name}' with {len(action_sequence)} steps")
+                print(f"  → Attempting to execute learned action pattern...")
 
                 # Capture and parse screen
                 state = capture_and_parse_screen(state)
@@ -1960,12 +1973,137 @@ def capture_screen_node(state: DeploymentState) -> DeploymentState:
 
 def match_elements_node(state: DeploymentState) -> DeploymentState:
     """
-    Match current screen elements using visual embeddings
+    Match current screen using page-level visual similarity.
+    If a similar page is found, get the action that followed it.
     """
-    print("🔍 Matching current screen elements using visual embeddings...")
+    print("🔍 Matching current screen using visual similarity...")
 
-    # Get all element nodes from database - using correct method name
-    all_elements = db.get_all_actions()
+    callback = state.get("callback")
+    step_num = state.get("current_step", 0)
+
+    # First try page-level visual matching (new approach)
+    vector_store = get_vector_db()
+    neo4j_db = get_db()
+
+    if vector_store and neo4j_db and state["current_page"].get("screenshot"):
+        screenshot_path = state["current_page"]["screenshot"]
+
+        # DEBUG: Log which screenshot is being used
+        print(f"[DEBUG] Visual similarity search using: {screenshot_path}")
+        is_gridded = "_grid" in screenshot_path
+        print(f"[DEBUG] Is gridded screenshot: {is_gridded}")
+        if is_gridded:
+            print("[WARNING] Using GRIDDED screenshot for similarity search - this will hurt accuracy!")
+
+        # Log that we're attempting similarity search
+        if callback:
+            callback(state, "visual_similarity_search", {
+                "step": step_num,
+                "message": "🔍 Querying ImageEmbedding service for visual similarity...",
+                "status": "started",
+                "screenshot_path": screenshot_path,
+            })
+
+        # Try to find similar pages in Pinecone
+        try:
+            from data.data_storage import find_similar_pages
+
+            similar_pages = find_similar_pages(
+                screenshot_path=screenshot_path,
+                vector_store=vector_store,
+                top_k=3,
+                similarity_threshold=0.80,  # 80% similarity threshold
+            )
+
+            if similar_pages:
+                best_match = similar_pages[0]
+                page_id = best_match["page_id"]
+                similarity = best_match["similarity_score"]
+                metadata = best_match.get("metadata", {})
+
+                print(f"✓ Found similar page (score: {similarity:.3f})")
+                print(f"  Task: {metadata.get('task_description', 'unknown')}")
+                print(f"  Step: {metadata.get('step', 'unknown')}")
+
+                # Log successful match
+                if callback:
+                    callback(state, "visual_similarity_search", {
+                        "step": step_num,
+                        "message": f"✓ Found similar page! Score: {similarity:.3f}",
+                        "status": "found",
+                        "similarity_score": similarity,
+                        "matched_task": metadata.get('task_description', 'unknown'),
+                        "matched_step": metadata.get('step', 'unknown'),
+                    })
+
+                # Get the element associated with this page from Neo4j
+                page_elements = neo4j_db.get_page_elements(page_id)
+                if page_elements:
+                    # Get the first element (the action taken on this page)
+                    element = page_elements[0]
+                    element_id = element.get("element_id")
+
+                    # Check if this element has a LEADS_TO relationship
+                    # For now, use the element's action info
+                    action_type = element.get("action_type", "tap")
+                    other_info = element.get("other_info", "{}")
+                    if isinstance(other_info, str):
+                        try:
+                            other_info = json.loads(other_info)
+                        except:
+                            other_info = {}
+
+                    square = other_info.get("square")
+                    coordinates = other_info.get("coordinates", {})
+
+                    if square or coordinates:
+                        print(f"✓ Found associated action: {action_type} on square {square}")
+                        state["matched_elements"] = [{
+                            "element_id": element_id,
+                            "action_type": action_type,
+                            "square": square,
+                            "coordinates": coordinates,
+                            "similarity_score": similarity,
+                            "from_visual_match": True,
+                        }]
+                        # Don't fallback - we have a match
+                        state["should_fallback"] = False
+                        return state
+                    else:
+                        print("⚠️ Page element has no square/coordinate info")
+                else:
+                    print(f"⚠️ No elements found for matched page")
+                    if callback:
+                        callback(state, "visual_similarity_search", {
+                            "step": step_num,
+                            "message": "⚠️ Similar page found but no associated action in Neo4j",
+                            "status": "no_action",
+                        })
+            else:
+                print("ℹ️ No similar pages found in knowledge graph")
+                if callback:
+                    callback(state, "visual_similarity_search", {
+                        "step": step_num,
+                        "message": "ℹ️ No similar pages found in knowledge graph (will use Claude)",
+                        "status": "not_found",
+                    })
+
+        except Exception as e:
+            print(f"⚠️ Visual matching error: {str(e)}")
+            if callback:
+                callback(state, "visual_similarity_search", {
+                    "step": step_num,
+                    "message": f"⚠️ Visual matching error: {str(e)}",
+                    "status": "error",
+                    "error": str(e),
+                })
+
+    # Fall back to original element matching if visual matching didn't find anything
+    if not neo4j_db:
+        print("⚠️ Neo4j not available, marking for fallback")
+        state["should_fallback"] = True
+        return state
+    all_elements = neo4j_db.get_all_actions()
     if not all_elements:
         print("⚠️ No element nodes in database, marking for fallback")
         state["should_fallback"] = True

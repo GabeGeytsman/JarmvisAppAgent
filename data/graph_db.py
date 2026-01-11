@@ -151,13 +151,39 @@ class Neo4jDatabase:
         return self.create_node("Action", properties)
 
     def create_node(self, label: str, properties: Dict[str, Any]) -> str:
-        """Generic node creation function"""
-        query = f"CREATE (n:{label} $properties) " "RETURN elementId(n) as node_id"
+        """Generic node creation function using MERGE to avoid duplicates.
 
-        with self.driver.session(database="neo4j") as session:
-            result = session.run(query, properties=properties)
-            record = result.single()
-            return str(record["node_id"]) if record else None
+        Uses MERGE on the primary key field to update existing nodes
+        instead of creating duplicates.
+        """
+        # Determine the primary key field based on label
+        primary_key_map = {
+            "Page": "page_id",
+            "Element": "element_id",
+            "Action": "action_id",
+        }
+
+        primary_key = primary_key_map.get(label)
+
+        if primary_key and primary_key in properties:
+            # Use MERGE to avoid duplicates - match on primary key, then set all properties
+            primary_value = properties[primary_key]
+            query = f"""
+            MERGE (n:{label} {{{primary_key}: $primary_value}})
+            SET n = $properties
+            RETURN elementId(n) as node_id
+            """
+            with self.driver.session(database="neo4j") as session:
+                result = session.run(query, primary_value=primary_value, properties=properties)
+                record = result.single()
+                return str(record["node_id"]) if record else None
+        else:
+            # Fallback to CREATE if no primary key (shouldn't happen normally)
+            query = f"CREATE (n:{label} $properties) RETURN elementId(n) as node_id"
+            with self.driver.session(database="neo4j") as session:
+                result = session.run(query, properties=properties)
+                record = result.single()
+                return str(record["node_id"]) if record else None
 
     def add_element_to_page(self, page_id: str, element_id: str) -> bool:
         """Create Page-HAS_ELEMENT->Element relationship"""
@@ -335,11 +361,12 @@ class Neo4jDatabase:
             print(f"Error getting chain start nodes: {str(e)}")
             return []
 
-    def get_chain_from_start(self, start_page_id: str) -> List[List[Dict[str, Any]]]:
+    def get_chain_from_start(self, start_page_id: str, verbose: bool = True) -> List[List[Dict[str, Any]]]:
         """Get complete operation chain from starting node, returning triplet chain structure
 
         Args:
             start_page_id: ID of the starting page
+            verbose: If True, print debug information
 
         Returns:
             List[List[Dict]]: List containing complete chain information, each chain consists of multiple triplets
@@ -349,6 +376,10 @@ class Neo4jDatabase:
                 - target_page: Target page node information
                 - action: Action information
         """
+        def log(msg):
+            if verbose:
+                print(f"[get_chain] {msg}")
+
         query = """
         MATCH path = (start:Page {page_id: $start_page_id})-[:HAS_ELEMENT|LEADS_TO*]->(end:Page)
         WHERE NOT EXISTS { (end)-[:HAS_ELEMENT]->() }  // Ensure it's an endpoint page
@@ -358,15 +389,21 @@ class Neo4jDatabase:
         RETURN node_props, rel_props
         """
 
+        log(f"Querying chain from start_page_id: {start_page_id}")
+
         try:
             with self.driver.session(database="neo4j") as session:
                 result = session.run(query, start_page_id=start_page_id)
                 chains = []
                 seen_chains = set()  # For deduplication
+                record_count = 0
 
                 for record in result:
+                    record_count += 1
                     nodes = record["node_props"]
                     rels = record["rel_props"]
+
+                    log(f"  Record {record_count}: {len(nodes)} nodes, {len(rels)} relationships")
 
                     # Build triplet chain
                     chain = []
@@ -375,25 +412,34 @@ class Neo4jDatabase:
 
                     while i < len(rels):
                         # Handle HAS_ELEMENT relationship
-                        if "element_id" in nodes[i + 1]:  # Found element node
+                        if i + 1 < len(nodes) and "element_id" in nodes[i + 1]:  # Found element node
                             element = nodes[i + 1]
                             # Continue looking for LEADS_TO relationship
                             if i + 1 < len(rels) and "action_name" in rels[i + 1]:
-                                target_page = nodes[i + 2]
-                                # Build triplet
-                                triplet = {
-                                    "source_page": current_page,
-                                    "element": element,
-                                    "target_page": target_page,
-                                    "action": rels[i + 1],
-                                }
-                                chain.append(triplet)
-                                current_page = target_page  # Update current page
-                                i += 2  # Skip two processed relationships
+                                if i + 2 < len(nodes):
+                                    target_page = nodes[i + 2]
+                                    action_name = rels[i + 1].get("action_name", "")
+                                    log(f"    Triplet: Page -> Element -> Page (action: '{action_name[:30]}...')")
+                                    # Build triplet
+                                    triplet = {
+                                        "source_page": current_page,
+                                        "element": element,
+                                        "target_page": target_page,
+                                        "action": rels[i + 1],
+                                    }
+                                    chain.append(triplet)
+                                    current_page = target_page  # Update current page
+                                    i += 2  # Skip two processed relationships
+                                else:
+                                    log(f"    WARNING: No target page at index {i+2}")
+                                    i += 1
                             else:
+                                log(f"    WARNING: No action_name in rel at index {i+1}, keys: {list(rels[i+1].keys()) if i+1 < len(rels) else 'N/A'}")
                                 i += 1
                         else:
                             i += 1
+
+                    log(f"  Built chain with {len(chain)} triplets")
 
                     if chain:  # Only add non-empty chains
                         # Create unique identifier for the chain
@@ -409,7 +455,10 @@ class Neo4jDatabase:
                             seen_chains.add(chain_key)
                             chains.append(chain)
 
-                return chains[0]
+                log(f"Found {len(chains)} unique chains, returning first one")
+                if chains:
+                    return chains[0]
+                return []
         except Exception as e:
             print(f"Error getting chain from start node: {str(e)}")
             return []
@@ -561,18 +610,24 @@ class Neo4jDatabase:
         Returns:
             List[Dict[str, Any]]: List containing relevant high-level action node information
         """
-        # First try fuzzy matching by task description
+        # Extract key words from task for matching (filter out common words)
+        common_words = {'a', 'an', 'the', 'and', 'or', 'to', 'for', 'in', 'on', 'at', 'of', 'up', 'look', 'open', 'find', 'search', 'get'}
+        task_words = [w.lower() for w in task.split() if w.lower() not in common_words and len(w) > 2]
+
+        print(f"[get_high_level_actions_for_task] Task: {task}")
+        print(f"[get_high_level_actions_for_task] Key words: {task_words}")
+
+        # Query all high-level actions and filter by keyword matching
         query = """
         MATCH (a:Action)
-        WHERE (a.is_high_level = true OR a.high_level = true OR a.type = 'high_level')
-        AND (a.name CONTAINS $task OR a.description CONTAINS $task)
+        WHERE a.is_high_level = true
         RETURN a
         """
 
         try:
             with self.driver.session(database="neo4j") as session:
-                result = session.run(query, task=task)
-                actions = []
+                result = session.run(query)
+                all_actions = []
                 for record in result:
                     action = dict(record["a"])
                     # Deserialize JSON string fields
@@ -585,13 +640,34 @@ class Neo4jDatabase:
                             )
                         except json.JSONDecodeError:
                             pass  # Keep as is if not valid JSON
-                    actions.append(action)
+                    all_actions.append(action)
 
-                # If no results found, return all high-level actions for further processing
-                if not actions:
-                    return self.get_all_high_level_actions()
+                print(f"[get_high_level_actions_for_task] Found {len(all_actions)} high-level actions total")
 
-                return actions
+                # Score each action based on keyword matches
+                scored_actions = []
+                for action in all_actions:
+                    name = (action.get("name", "") or "").lower()
+                    desc = (action.get("description", "") or "").lower()
+                    combined = f"{name} {desc}"
+
+                    # Count matching keywords
+                    matches = sum(1 for word in task_words if word in combined)
+                    if matches > 0:
+                        print(f"  → '{action.get('name')}' matched {matches}/{len(task_words)} keywords")
+                        scored_actions.append((matches, action))
+
+                # Sort by match count (descending) and return
+                scored_actions.sort(key=lambda x: x[0], reverse=True)
+                matching_actions = [action for _, action in scored_actions]
+
+                if matching_actions:
+                    print(f"[get_high_level_actions_for_task] Returning {len(matching_actions)} matching actions")
+                    return matching_actions
+                else:
+                    print("[get_high_level_actions_for_task] No keyword matches, returning all high-level actions")
+                    return all_actions
+
         except Exception as e:
             print(f"Error getting high level actions for task '{task}': {str(e)}")
             return []

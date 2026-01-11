@@ -102,9 +102,13 @@ class VectorStore:
         top_k: int = 5,
         filter_dict: Optional[Dict] = None,
     ) -> Dict:
-        """Query similar vectors and parse JSON strings in the results"""
+        """Query similar vectors and parse JSON strings in the results.
+
+        Note: Pinecone SDK v8+ returns QueryResponse objects, not dicts.
+        This function converts to dict format for backwards compatibility.
+        """
         try:
-            results = self.index.query(
+            response = self.index.query(
                 namespace=node_type.value,
                 vector=query_vector,
                 top_k=top_k,
@@ -113,17 +117,29 @@ class VectorStore:
                 filter=filter_dict,
             )
 
-            if "matches" in results:
-                for match in results["matches"]:
-                    if "metadata" in match:
-                        for key, value in match["metadata"].items():
-                            try:
-                                if isinstance(value, str) and (
-                                    value.startswith("{") or value.startswith("[")
-                                ):
-                                    match["metadata"][key] = json.loads(value)
-                            except json.JSONDecodeError:
-                                continue
+            # Convert QueryResponse to dict format for backwards compatibility
+            results = {"matches": []}
+
+            if hasattr(response, 'matches') and response.matches:
+                for match in response.matches:
+                    match_dict = {
+                        "id": match.id,
+                        "score": match.score,
+                        "values": match.values if hasattr(match, 'values') else [],
+                        "metadata": dict(match.metadata) if match.metadata else {},
+                    }
+
+                    # Parse JSON strings in metadata
+                    for key, value in match_dict["metadata"].items():
+                        try:
+                            if isinstance(value, str) and (
+                                value.startswith("{") or value.startswith("[")
+                            ):
+                                match_dict["metadata"][key] = json.loads(value)
+                        except json.JSONDecodeError:
+                            continue
+
+                    results["matches"].append(match_dict)
 
             return results
         except Exception as e:

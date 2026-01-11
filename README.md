@@ -14,6 +14,53 @@ Experimental results on multiple benchmark tasks demonstrate that our approach s
 
 ---
 
+## Current Architecture (Grid-Based, No OmniParser)
+
+This fork has been significantly refactored to use a **numbered grid overlay system** instead of OmniParser for UI element identification. This approach is simpler, faster, and more reliable.
+
+### How the Grid System Works
+
+1. **Screenshot Capture**: Raw screenshot is taken from Android device via ADB
+2. **Grid Overlay**: A 9×22 = 198 numbered squares are overlaid on the screenshot
+3. **Adaptive Colors**: Grid numbers use the complement of the dominant background color for visibility
+4. **LLM Reasoning**: Claude analyzes the gridded image and returns a square number to tap
+5. **Coordinate Translation**: Square number is converted to (x, y) coordinates for ADB
+
+```
+┌─────┬─────┬─────┬─────┬─────┬─────┬─────┬─────┬─────┐
+│  1  │  2  │  3  │  4  │  5  │  6  │  7  │  8  │  9  │
+├─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
+│ 10  │ 11  │ 12  │ 13  │ 14  │ 15  │ 16  │ 17  │ 18  │
+├─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
+│ ... │     │     │     │     │     │     │     │ ... │
+├─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
+│ 190 │ 191 │ 192 │ 193 │ 194 │ 195 │ 196 │ 197 │ 198 │
+└─────┴─────┴─────┴─────┴─────┴─────┴─────┴─────┴─────┘
+```
+
+### Key Components
+
+| Component | File | Purpose |
+|-----------|------|---------|
+| Grid Overlay | `explor_auto.py` | `add_coordinate_grid()` - adds numbered squares to screenshots |
+| Screen Actions | `tool/screen_content.py` | `screen_action` tool - translates squares to ADB commands |
+| Exploration | `explor_auto.py` | LangGraph workflow for autonomous task exploration |
+| Deployment | `deployment.py` | Execute tasks, optionally using knowledge graph templates |
+| Knowledge Graph | `data/graph_db.py` | Neo4j storage for learned action sequences |
+| Vector Embeddings | `data/vector_db.py` | Pinecone storage for visual similarity search |
+| Image Features | `backend/ImageEmbedding/` | ResNet50-based feature extraction service |
+
+### Services Overview
+
+| Service | Port | Purpose | Required? |
+|---------|------|---------|-----------|
+| **Gradio Demo** | 7860 | Main UI | Yes |
+| **ImageEmbedding** | 8001 | ResNet50 feature extraction for visual similarity | For knowledge graph |
+| **Neo4j** | 7687 | Graph database for action chains | For knowledge graph |
+| **~~OmniParser~~** | ~~8000~~ | ~~UI element detection~~ | **REMOVED** |
+
+---
+
 ## Detailed Setup Guide (macOS)
 
 This guide covers setting up AppAgentX on macOS with local services (no Docker). Tested on macOS with Apple Silicon (M-series chips).
@@ -42,11 +89,11 @@ You'll need accounts and API keys for the following services:
 
 | Service | Purpose | Where to Get |
 |---------|---------|--------------|
-| **OpenAI** | LLM for task reasoning (GPT-4o with vision) | https://platform.openai.com/api-keys |
-| **Pinecone** | Vector database for embeddings | https://www.pinecone.io/ (free tier available) |
-| **Neo4j** | Graph database for action chains | Local install or https://neo4j.com/ |
+| **Anthropic** | Claude for task reasoning (vision-capable) | https://console.anthropic.com/ |
+| **Pinecone** | Vector database for embeddings (optional) | https://www.pinecone.io/ (free tier available) |
+| **Neo4j** | Graph database for action chains (optional) | Local install or https://neo4j.com/ |
 
-**Important:** DeepSeek's `deepseek-chat` model does NOT support vision/images. You must use OpenAI GPT-4o or another vision-capable model.
+**Note:** The system uses Claude (claude-sonnet-4-5-20250929 or claude-opus-4-5-20251101) for vision-based reasoning. Configure the model in `config.py`.
 
 ### 3. Configure Secrets
 
@@ -58,14 +105,17 @@ cp app_secrets.example.py app_secrets.py
 
 Edit `app_secrets.py`:
 ```python
-# OpenAI (required - must be vision-capable model)
+# Anthropic (required)
+ANTHROPIC_API_KEY = "sk-ant-your-key-here"
+
+# Legacy OpenAI (optional, not currently used)
 LLM_BASE_URL = "https://api.openai.com/v1"
 LLM_API_KEY = "sk-proj-your-key-here"
 
-# Pinecone (required)
+# Pinecone (optional - for knowledge graph visual matching)
 PINECONE_API_KEY = "your-pinecone-key"
 
-# Neo4j (local installation)
+# Neo4j (optional - for knowledge graph)
 NEO4J_URI = "neo4j://127.0.0.1:7687"
 NEO4J_USERNAME = "neo4j"
 NEO4J_PASSWORD = "your-neo4j-password"
@@ -90,36 +140,7 @@ pip install "paddleocr<3.0"
 pip install paddlepaddle
 ```
 
-### 5. Download OmniParser Model Weights
-
-Download the following models from HuggingFace and place them in the correct directories:
-
-```bash
-# Create weights directory
-mkdir -p backend/OmniParser/weights
-
-# Download from HuggingFace:
-# 1. Icon detection model (YOLO-based)
-#    https://huggingface.co/microsoft/OmniParser
-#    -> Place in: backend/OmniParser/weights/icon_detect_v1_5/model.pt
-
-# 2. Icon caption model (Florence2-based)
-#    https://huggingface.co/microsoft/OmniParser
-#    -> Place in: backend/OmniParser/weights/icon_caption_florence/
-```
-
-Expected structure:
-```
-backend/OmniParser/weights/
-├── icon_detect_v1_5/
-│   └── model.pt (or best.pt - check your download)
-└── icon_caption_florence/
-    ├── config.json
-    ├── model.safetensors
-    └── ... (other Florence2 files)
-```
-
-### 6. Set Up Neo4j
+### 5. Set Up Neo4j (Optional - for Knowledge Graph)
 
 1. Download and install [Neo4j Desktop](https://neo4j.com/download/)
 2. Create a new project and database
@@ -127,7 +148,14 @@ backend/OmniParser/weights/
 4. Set your password (update `app_secrets.py` accordingly)
 5. The database should be accessible at `bolt://localhost:7687`
 
-### 7. Set Up Android Emulator
+To start Neo4j from command line:
+```bash
+neo4j start
+# Check status: neo4j status
+# Stop: neo4j stop
+```
+
+### 6. Set Up Android Emulator
 
 1. Install [Android Studio](https://developer.android.com/studio)
 2. Open **Device Manager** (Tools > Device Manager)
@@ -139,35 +167,34 @@ backend/OmniParser/weights/
    # Should show: emulator-5554    device
    ```
 
-### 8. Start Backend Services
+### 7. Start Backend Services (Optional)
 
-You need to run two backend services in separate terminals:
+The ImageEmbedding service is only needed if you want to use the knowledge graph for visual similarity matching. **For basic exploration/deployment, you can skip this.**
 
-**Terminal 1 - OmniParser (Screen Parsing)**
-```bash
-cd backend/OmniParser
-python omni.py
-# Runs on http://127.0.0.1:8000
-```
-
-**Terminal 2 - ImageEmbedding (Feature Extraction)**
+**Terminal 1 - ImageEmbedding (Feature Extraction) - Optional**
 ```bash
 cd backend/ImageEmbedding
 python image_embedding.py
 # Runs on http://127.0.0.1:8001
+# Uses ResNet50 for image feature extraction
 ```
 
-Wait for both services to fully load (OmniParser takes ~30-60 seconds to load Florence2 model).
+After starting, initialize the model:
+```bash
+curl -X POST "http://127.0.0.1:8001/set_model" \
+    -H "Content-Type: application/json" \
+    -d '{"model_name": "resnet50"}'
+```
 
-### 9. Launch the Demo
+### 8. Launch the Demo
 
-**Terminal 3 - Main Application**
+**Main Terminal - Application**
 ```bash
 python demo.py
 # Opens Gradio UI at http://localhost:7860
 ```
 
-### 10. Using the Application
+### 9. Using the Application
 
 1. Open http://localhost:7860 in your browser
 2. Go to **Initialization** tab
@@ -183,34 +210,6 @@ python demo.py
 
 ## Troubleshooting
 
-### Florence2 Beam Search Error
-```
-'NoneType' object has no attribute 'shape'
-```
-**Solution:** Downgrade transformers to 4.49.0
-```bash
-pip install transformers==4.49.0
-```
-
-### PaddleOCR langchain Import Error
-```
-ModuleNotFoundError: No module named 'langchain.docstore'
-```
-**Solution:** Use PaddleOCR 2.x instead of 3.x
-```bash
-pip uninstall paddleocr paddlex
-pip install "paddleocr<3.0"
-```
-
-### OmniParser Model Loading - attention_mask Warning
-If you see warnings about `attention_mask` with Florence2, the model will still work but you can suppress warnings by ensuring you have the correct transformers version.
-
-### LLM Vision Not Supported
-```
-openai.BadRequestError: unknown variant 'image_url'
-```
-**Solution:** Your LLM model doesn't support vision. Use OpenAI GPT-4o or another vision-capable model. DeepSeek's standard API does NOT support images.
-
 ### ADB Device Not Found
 ```bash
 # Check if ADB sees the device
@@ -222,12 +221,79 @@ adb devices
 # 3. ADB is in your PATH
 ```
 
+### Neo4j Connection Failed
+```bash
+# Check if Neo4j is running
+neo4j status
+
+# Start Neo4j
+neo4j start
+
+# If using Neo4j Desktop, ensure the database is started in the UI
+```
+
 ### Port Already in Use
 ```bash
 # Find and kill process on port
-lsof -ti:8000 | xargs kill -9  # OmniParser
 lsof -ti:8001 | xargs kill -9  # ImageEmbedding
 lsof -ti:7860 | xargs kill -9  # Gradio
+lsof -ti:7687 | xargs kill -9  # Neo4j
+```
+
+### Claude API Errors
+- Ensure your `ANTHROPIC_API_KEY` is valid in `app_secrets.py`
+- Check you have sufficient API credits
+- The model name in `config.py` must be a valid Claude model (e.g., `claude-sonnet-4-5-20250929`)
+
+---
+
+## Neo4j Queries (Knowledge Graph)
+
+Access the Neo4j browser at http://localhost:7474 (default credentials: neo4j / your-password).
+
+### View All Nodes and Relationships
+```cypher
+MATCH (n)-[r]->(m) RETURN n, r, m LIMIT 100
+```
+
+### View All Pages
+```cypher
+MATCH (p:Page) RETURN p
+```
+
+### View All Elements
+```cypher
+MATCH (e:Element) RETURN e
+```
+
+### View Page → Element → Page Chains
+```cypher
+MATCH (p1:Page)-[:HAS_ELEMENT]->(e:Element)-[:LEADS_TO]->(p2:Page)
+RETURN p1, e, p2
+```
+
+### View Chain Starting Points (First Pages)
+```cypher
+MATCH (p:Page)
+WHERE NOT EXISTS { MATCH ()-[:LEADS_TO]->(p) }
+RETURN p
+```
+
+### View Complete Action Chain from a Task
+```cypher
+MATCH path = (start:Page)-[:HAS_ELEMENT|LEADS_TO*]->(end:Page)
+WHERE NOT EXISTS { (end)-[:HAS_ELEMENT]->() }
+RETURN path LIMIT 10
+```
+
+### Clear All Data (Use with Caution!)
+```cypher
+MATCH (n) DETACH DELETE n
+```
+
+### Count Nodes by Type
+```cypher
+MATCH (n) RETURN labels(n) as type, count(n) as count
 ```
 
 ---
@@ -235,32 +301,53 @@ lsof -ti:7860 | xargs kill -9  # Gradio
 ## Architecture Overview
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                      Gradio UI (demo.py)                     │
-│                    http://localhost:7860                     │
-└─────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────┐
-│                 LangGraph State Machine                      │
-│   tsk_setting → page_understand → perform_action → ...      │
-│                    (explor_auto.py)                          │
-└─────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────┐
+│                         Gradio UI (demo.py)                              │
+│                       http://localhost:7860                              │
+│  ┌──────────────┬─────────────────┬──────────────┬───────────────────┐  │
+│  │Initialization│ Auto Exploration│User Exploration│ Action Execution │  │
+│  └──────────────┴─────────────────┴──────────────┴───────────────────┘  │
+└─────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│                      LangGraph State Machine                             │
+│                                                                          │
+│   Exploration (explor_auto.py):                                         │
+│   tsk_setting → page_understand → perform_action → task_judgment        │
+│                                                                          │
+│   Deployment (deployment.py):                                           │
+│   capture_screen → [knowledge_graph_lookup] → react_action → judgment   │
+└─────────────────────────────────────────────────────────────────────────┘
           │                    │                    │
           ▼                    ▼                    ▼
-┌─────────────┐    ┌─────────────────┐    ┌─────────────────┐
-│   OpenAI    │    │   OmniParser    │    │  ADB Controller │
-│   GPT-4o    │    │  (port 8000)    │    │  (Android)      │
-│   (Vision)  │    │  YOLO+Florence2 │    │                 │
-└─────────────┘    └─────────────────┘    └─────────────────┘
-                           │
-                           ▼
-                   ┌─────────────────┐
-                   │ ImageEmbedding  │
-                   │  (port 8001)    │
-                   │   ResNet50      │
-                   └─────────────────┘
+┌─────────────────┐  ┌─────────────────┐  ┌─────────────────────────────┐
+│    Anthropic    │  │  Grid Overlay   │  │      ADB Controller         │
+│     Claude      │  │  (9x22=198 sq)  │  │        (Android)            │
+│ claude-sonnet   │  │  Adaptive color │  │  tap/swipe/text/screenshot  │
+│    (Vision)     │  │  number labels  │  │                             │
+└─────────────────┘  └─────────────────┘  └─────────────────────────────┘
+                                    │
+          ┌─────────────────────────┴─────────────────────────┐
+          ▼                                                   ▼
+┌─────────────────────────┐                    ┌─────────────────────────┐
+│   Neo4j (port 7687)     │                    │  ImageEmbedding (8001)  │
+│   Knowledge Graph       │◄──────────────────►│  ResNet50 Features      │
+│   Page→Element→Page     │                    │         │               │
+│   Action Templates      │                    │         ▼               │
+└─────────────────────────┘                    │  Pinecone (cloud)       │
+                                               │  Vector Similarity      │
+                                               └─────────────────────────┘
 ```
+
+### Data Flow
+
+1. **Screenshot** → ADB captures raw screen from Android device
+2. **Grid Overlay** → 198 numbered squares added with adaptive colors
+3. **Claude Vision** → Analyzes gridded image, reasons about task, returns square number
+4. **Coordinate Translation** → Square number → (x, y) pixel coordinates
+5. **ADB Action** → Executes tap/swipe/text at coordinates
+6. **Knowledge Graph** (optional) → Stores successful action sequences for replay
 
 ---
 
